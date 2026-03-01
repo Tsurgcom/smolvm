@@ -145,6 +145,16 @@ impl CrunCommand {
         c
     }
 
+    /// List all containers: `crun list -f json`
+    ///
+    /// Returns all containers in a single invocation, much faster than
+    /// calling `crun state` per container during reconciliation.
+    pub fn list() -> Self {
+        let mut c = Self::new();
+        c.cmd.args(["list", "-f", "json"]);
+        c
+    }
+
     /// Set stdin to null.
     pub fn stdin_null(mut self) -> Self {
         self.cmd.stdin(Stdio::null());
