@@ -189,14 +189,6 @@ impl SmolvmConfig {
         })
     }
 
-    /// No-op retained for backward compatibility.
-    ///
-    /// The database is now opened per-operation, so there is no persistent
-    /// handle or file lock to release.
-    pub fn close_db(&self) {
-        self.db.close();
-    }
-
     /// Save configuration to the database.
     ///
     /// This is now a no-op for VM records since writes are immediate.

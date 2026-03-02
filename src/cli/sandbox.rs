@@ -479,7 +479,6 @@ impl RunCmd {
                             workdir: params.workdir.clone(),
                         }),
                     );
-                    config.close_db();
                 }
             }
 

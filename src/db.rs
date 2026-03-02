@@ -20,6 +20,17 @@ const VMS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vms");
 /// Table for storing global configuration settings.
 const CONFIG_TABLE: TableDefinition<&str, &str> = TableDefinition::new("config");
 
+/// Extension trait to convert errors into `Error::database`.
+trait DbResultExt<T> {
+    fn db_err(self, operation: impl Into<String>) -> Result<T>;
+}
+
+impl<T, E: std::fmt::Display> DbResultExt<T> for std::result::Result<T, E> {
+    fn db_err(self, operation: impl Into<String>) -> Result<T> {
+        self.map_err(|e| Error::database(operation, e.to_string()))
+    }
+}
+
 /// Thread-safe database handle for smolvm state persistence.
 ///
 /// Each operation opens the database, runs a transaction, and closes the handle,
@@ -40,8 +51,7 @@ impl SmolvmDb {
         F: FnOnce(&Database) -> Result<T>,
     {
         let _guard = self.lock.lock();
-        let db = Database::create(&self.path)
-            .map_err(|e| Error::database("open database", e.to_string()))?;
+        let db = Database::create(&self.path).db_err("open database")?;
         f(&db)
     }
 
@@ -60,10 +70,8 @@ impl SmolvmDb {
     ///
     /// Creates parent directories if they don't exist.
     pub fn open_at(path: &Path) -> Result<Self> {
-        // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::database("create directory", e.to_string()))?;
+            std::fs::create_dir_all(parent).db_err("create directory")?;
         }
 
         let instance = Self {
@@ -71,9 +79,7 @@ impl SmolvmDb {
             lock: Arc::new(Mutex::new(())),
         };
 
-        // Initialize tables
         instance.init_tables()?;
-
         Ok(instance)
     }
 
@@ -85,33 +91,15 @@ impl SmolvmDb {
         Ok(data_dir.join("smolvm").join("server").join("smolvm.redb"))
     }
 
-    /// Close the database, releasing the file lock.
-    ///
-    /// No-op: the database is opened per-operation, so there is no persistent
-    /// handle to release. Retained for backward compatibility with callers.
-    pub fn close(&self) {
-        // No-op: database is opened per-operation, no persistent handle to release.
-    }
-
     /// Initialize database tables.
     fn init_tables(&self) -> Result<()> {
         self.with_db(|db| {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
-
-            // Create tables if they don't exist
-            write_txn
-                .open_table(VMS_TABLE)
-                .map_err(|e| Error::database("create vms table", e.to_string()))?;
+            let write_txn = db.begin_write().db_err("begin write transaction")?;
+            write_txn.open_table(VMS_TABLE).db_err("create vms table")?;
             write_txn
                 .open_table(CONFIG_TABLE)
-                .map_err(|e| Error::database("create config table", e.to_string()))?;
-
-            write_txn
-                .commit()
-                .map_err(|e| Error::database("commit table creation", e.to_string()))?;
-
+                .db_err("create config table")?;
+            write_txn.commit().db_err("commit table creation")?;
             Ok(())
         })
     }
@@ -122,27 +110,17 @@ impl SmolvmDb {
 
     /// Insert or update a VM record.
     pub fn insert_vm(&self, name: &str, record: &VmRecord) -> Result<()> {
-        let json = serde_json::to_vec(record)
-            .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
+        let json = serde_json::to_vec(record).db_err("serialize vm record")?;
 
         self.with_db(|db| {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
-
+            let write_txn = db.begin_write().db_err("begin write transaction")?;
             {
-                let mut table = write_txn
-                    .open_table(VMS_TABLE)
-                    .map_err(|e| Error::database("open vms table", e.to_string()))?;
+                let mut table = write_txn.open_table(VMS_TABLE).db_err("open vms table")?;
                 table
                     .insert(name, json.as_slice())
-                    .map_err(|e| Error::database(format!("insert vm '{}'", name), e.to_string()))?;
+                    .db_err(format!("insert vm '{}'", name))?;
             }
-
-            write_txn
-                .commit()
-                .map_err(|e| Error::database("commit vm insert", e.to_string()))?;
-
+            write_txn.commit().db_err("commit vm insert")?;
             Ok(())
         })
     }
@@ -152,39 +130,29 @@ impl SmolvmDb {
     /// Returns `Ok(true)` if inserted, `Ok(false)` if already exists.
     /// This provides atomic conflict detection at the database level.
     pub fn insert_vm_if_not_exists(&self, name: &str, record: &VmRecord) -> Result<bool> {
-        let json = serde_json::to_vec(record)
-            .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
+        let json = serde_json::to_vec(record).db_err("serialize vm record")?;
 
         self.with_db(|db| {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
+            let write_txn = db.begin_write().db_err("begin write transaction")?;
 
             let inserted = {
-                let mut table = write_txn
-                    .open_table(VMS_TABLE)
-                    .map_err(|e| Error::database("open vms table", e.to_string()))?;
-
-                // Check if key already exists
+                let mut table = write_txn.open_table(VMS_TABLE).db_err("open vms table")?;
                 let exists = table
                     .get(name)
-                    .map_err(|e| Error::database(format!("check vm '{}'", name), e.to_string()))?
+                    .db_err(format!("check vm '{}'", name))?
                     .is_some();
 
                 if exists {
                     false
                 } else {
-                    table.insert(name, json.as_slice()).map_err(|e| {
-                        Error::database(format!("insert vm '{}'", name), e.to_string())
-                    })?;
+                    table
+                        .insert(name, json.as_slice())
+                        .db_err(format!("insert vm '{}'", name))?;
                     true
                 }
             };
 
-            write_txn
-                .commit()
-                .map_err(|e| Error::database("commit vm insert", e.to_string()))?;
-
+            write_txn.commit().db_err("commit vm insert")?;
             Ok(inserted)
         })
     }
@@ -192,19 +160,13 @@ impl SmolvmDb {
     /// Get a VM record by name.
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
         self.with_db(|db| {
-            let read_txn = db
-                .begin_read()
-                .map_err(|e| Error::database("begin read transaction", e.to_string()))?;
-
-            let table = read_txn
-                .open_table(VMS_TABLE)
-                .map_err(|e| Error::database("open vms table", e.to_string()))?;
+            let read_txn = db.begin_read().db_err("begin read transaction")?;
+            let table = read_txn.open_table(VMS_TABLE).db_err("open vms table")?;
 
             match table.get(name) {
                 Ok(Some(guard)) => {
-                    let record: VmRecord = serde_json::from_slice(guard.value()).map_err(|e| {
-                        Error::database(format!("deserialize vm record '{}'", name), e.to_string())
-                    })?;
+                    let record: VmRecord = serde_json::from_slice(guard.value())
+                        .db_err(format!("deserialize vm record '{}'", name))?;
                     Ok(Some(record))
                 }
                 Ok(None) => Ok(None),
@@ -219,29 +181,18 @@ impl SmolvmDb {
     /// preventing TOCTOU races with concurrent writers.
     pub fn remove_vm(&self, name: &str) -> Result<Option<VmRecord>> {
         self.with_db(|db| {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
+            let write_txn = db.begin_write().db_err("begin write transaction")?;
 
             let existing = {
-                let mut table = write_txn
-                    .open_table(VMS_TABLE)
-                    .map_err(|e| Error::database("open vms table", e.to_string()))?;
+                let mut table = write_txn.open_table(VMS_TABLE).db_err("open vms table")?;
 
                 // Read and deserialize first, releasing the AccessGuard before mutation
                 let record = {
-                    let get_result = table.get(name).map_err(|e| {
-                        Error::database(format!("get vm '{}'", name), e.to_string())
-                    })?;
+                    let get_result = table.get(name).db_err(format!("get vm '{}'", name))?;
                     match get_result {
                         Some(guard) => {
-                            let r: VmRecord =
-                                serde_json::from_slice(guard.value()).map_err(|e| {
-                                    Error::database(
-                                        format!("deserialize vm record '{}'", name),
-                                        e.to_string(),
-                                    )
-                                })?;
+                            let r: VmRecord = serde_json::from_slice(guard.value())
+                                .db_err(format!("deserialize vm record '{}'", name))?;
                             Some(r)
                         }
                         None => None,
@@ -250,17 +201,12 @@ impl SmolvmDb {
 
                 // Now safe to mutate — AccessGuard is dropped
                 if record.is_some() {
-                    table.remove(name).map_err(|e| {
-                        Error::database(format!("remove vm '{}'", name), e.to_string())
-                    })?;
+                    table.remove(name).db_err(format!("remove vm '{}'", name))?;
                 }
                 record
             };
 
-            write_txn
-                .commit()
-                .map_err(|e| Error::database("commit vm removal", e.to_string()))?;
-
+            write_txn.commit().db_err("commit vm removal")?;
             Ok(existing)
         })
     }
@@ -268,25 +214,15 @@ impl SmolvmDb {
     /// List all VM records.
     pub fn list_vms(&self) -> Result<Vec<(String, VmRecord)>> {
         self.with_db(|db| {
-            let read_txn = db
-                .begin_read()
-                .map_err(|e| Error::database("begin read transaction", e.to_string()))?;
-
-            let table = read_txn
-                .open_table(VMS_TABLE)
-                .map_err(|e| Error::database("open vms table", e.to_string()))?;
+            let read_txn = db.begin_read().db_err("begin read transaction")?;
+            let table = read_txn.open_table(VMS_TABLE).db_err("open vms table")?;
 
             let mut vms = Vec::new();
-            for entry in table
-                .iter()
-                .map_err(|e| Error::database("iterate vms table", e.to_string()))?
-            {
-                let (key, value) =
-                    entry.map_err(|e| Error::database("read vms entry", e.to_string()))?;
+            for entry in table.iter().db_err("iterate vms table")? {
+                let (key, value) = entry.db_err("read vms entry")?;
                 let name = key.value().to_string();
-                let record: VmRecord = serde_json::from_slice(value.value()).map_err(|e| {
-                    Error::database(format!("deserialize vm record '{}'", name), e.to_string())
-                })?;
+                let record: VmRecord = serde_json::from_slice(value.value())
+                    .db_err(format!("deserialize vm record '{}'", name))?;
                 vms.push((name, record));
             }
 
@@ -296,38 +232,27 @@ impl SmolvmDb {
 
     /// Update a VM record in place using a closure.
     ///
-    /// Returns `Some(())` if the VM was found and updated, `None` if not found.
+    /// Returns the updated record if found, `None` if not found.
     ///
     /// Uses a single write transaction to atomically read, mutate, and write back,
     /// preventing lost updates from concurrent writers.
-    pub fn update_vm<F>(&self, name: &str, f: F) -> Result<Option<()>>
+    pub fn update_vm<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>>
     where
         F: FnOnce(&mut VmRecord),
     {
         self.with_db(|db| {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
+            let write_txn = db.begin_write().db_err("begin write transaction")?;
 
             let updated = {
-                let mut table = write_txn
-                    .open_table(VMS_TABLE)
-                    .map_err(|e| Error::database("open vms table", e.to_string()))?;
+                let mut table = write_txn.open_table(VMS_TABLE).db_err("open vms table")?;
 
                 // Read and deserialize first, releasing the AccessGuard before mutation
                 let record = {
-                    let get_result = table.get(name).map_err(|e| {
-                        Error::database(format!("get vm '{}'", name), e.to_string())
-                    })?;
+                    let get_result = table.get(name).db_err(format!("get vm '{}'", name))?;
                     match get_result {
                         Some(guard) => {
-                            let r: VmRecord =
-                                serde_json::from_slice(guard.value()).map_err(|e| {
-                                    Error::database(
-                                        format!("deserialize vm record '{}'", name),
-                                        e.to_string(),
-                                    )
-                                })?;
+                            let r: VmRecord = serde_json::from_slice(guard.value())
+                                .db_err(format!("deserialize vm record '{}'", name))?;
                             Some(r)
                         }
                         None => None,
@@ -338,22 +263,18 @@ impl SmolvmDb {
                 match record {
                     Some(mut record) => {
                         f(&mut record);
-                        let json = serde_json::to_vec(&record)
-                            .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
-                        table.insert(name, json.as_slice()).map_err(|e| {
-                            Error::database(format!("update vm '{}'", name), e.to_string())
-                        })?;
-                        true
+                        let json = serde_json::to_vec(&record).db_err("serialize vm record")?;
+                        table
+                            .insert(name, json.as_slice())
+                            .db_err(format!("update vm '{}'", name))?;
+                        Some(record)
                     }
-                    None => false,
+                    None => None,
                 }
             };
 
-            write_txn
-                .commit()
-                .map_err(|e| Error::database("commit vm update", e.to_string()))?;
-
-            Ok(if updated { Some(()) } else { None })
+            write_txn.commit().db_err("commit vm update")?;
+            Ok(updated)
         })
     }
 
@@ -370,13 +291,10 @@ impl SmolvmDb {
     /// Get a global configuration value.
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
         self.with_db(|db| {
-            let read_txn = db
-                .begin_read()
-                .map_err(|e| Error::database("begin read transaction", e.to_string()))?;
-
+            let read_txn = db.begin_read().db_err("begin read transaction")?;
             let table = read_txn
                 .open_table(CONFIG_TABLE)
-                .map_err(|e| Error::database("open config table", e.to_string()))?;
+                .db_err("open config table")?;
 
             match table.get(key) {
                 Ok(Some(guard)) => Ok(Some(guard.value().to_string())),
@@ -392,23 +310,16 @@ impl SmolvmDb {
     /// Set a global configuration value.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
         self.with_db(|db| {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
-
+            let write_txn = db.begin_write().db_err("begin write transaction")?;
             {
                 let mut table = write_txn
                     .open_table(CONFIG_TABLE)
-                    .map_err(|e| Error::database("open config table", e.to_string()))?;
+                    .db_err("open config table")?;
                 table
                     .insert(key, value)
-                    .map_err(|e| Error::database(format!("set config '{}'", key), e.to_string()))?;
+                    .db_err(format!("set config '{}'", key))?;
             }
-
-            write_txn
-                .commit()
-                .map_err(|e| Error::database("commit config set", e.to_string()))?;
-
+            write_txn.commit().db_err("commit config set")?;
             Ok(())
         })
     }
@@ -450,14 +361,14 @@ mod tests {
         assert_eq!(retrieved.cpus, 2);
         assert_eq!(retrieved.mem, 1024);
 
-        // Update
-        db.update_vm("test-vm", |r| {
-            r.state = RecordState::Running;
-            r.pid = Some(12345);
-        })
-        .unwrap();
-
-        let updated = db.get_vm("test-vm").unwrap().unwrap();
+        // Update — returns the mutated record
+        let updated = db
+            .update_vm("test-vm", |r| {
+                r.state = RecordState::Running;
+                r.pid = Some(12345);
+            })
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.state, RecordState::Running);
         assert_eq!(updated.pid, Some(12345));
 

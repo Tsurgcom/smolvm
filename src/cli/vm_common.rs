@@ -386,9 +386,6 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     });
     config.save()?;
 
-    // No-op: DB is opened per-operation, no persistent lock to release.
-    config.close_db();
-
     // Run init commands if configured
     if !record.init.is_empty() {
         println!("Running {} init command(s)...", record.init.len());
@@ -423,7 +420,6 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
 ///
 /// Creates the record if it doesn't exist, then updates state to Running
 /// with the current PID and optional config overrides (cpus, mem, etc.).
-/// The database is opened per-operation so no explicit close is needed.
 pub fn persist_default_running(
     config: &mut SmolvmConfig,
     pid: Option<i32>,
@@ -505,7 +501,6 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
 
     // Run init commands if the default record has them (persisted from sandbox run -d -s)
     let record = config.get_vm("default").cloned();
-    config.close_db();
 
     if let Some(record) = record {
         if !record.init.is_empty() {
