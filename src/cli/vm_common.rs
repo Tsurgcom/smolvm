@@ -386,8 +386,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     });
     config.save()?;
 
-    // Release the database lock so other smolvm commands can run concurrently
-    // (e.g. `smolvm microvm exec` while init commands are still running).
+    // No-op: DB is opened per-operation, no persistent lock to release.
     config.close_db();
 
     // Run init commands if configured
@@ -424,7 +423,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
 ///
 /// Creates the record if it doesn't exist, then updates state to Running
 /// with the current PID and optional config overrides (cpus, mem, etc.).
-/// Call `config.close_db()` after this to release the lock.
+/// The database is opened per-operation so no explicit close is needed.
 pub fn persist_default_running(
     config: &mut SmolvmConfig,
     pid: Option<i32>,
