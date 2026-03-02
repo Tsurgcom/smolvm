@@ -524,9 +524,27 @@ where
             // stdout(1), stderr(2) for error output during child setup.
             // The child opens fresh fds for everything it needs.
             unsafe {
-                let max_fd = libc::getdtablesize();
-                for fd in 3..max_fd {
-                    libc::close(fd);
+                #[cfg(target_os = "linux")]
+                {
+                    // Use close_range() (Linux 5.9+) for O(1) fd closure instead
+                    // of iterating through potentially 500K+ fds one at a time.
+                    let ret = libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+                    if ret != 0 {
+                        // Fallback for older kernels
+                        let max_fd = libc::getdtablesize();
+                        for fd in 3..max_fd {
+                            libc::close(fd);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // macOS: no close_range syscall, but getdtablesize() is
+                    // typically small (e.g. 1024) so iteration is fast.
+                    let max_fd = libc::getdtablesize();
+                    for fd in 3..max_fd {
+                        libc::close(fd);
+                    }
                 }
             }
 
