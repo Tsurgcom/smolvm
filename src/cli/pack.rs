@@ -426,6 +426,7 @@ impl PackCmd {
         }
 
         // Check common locations
+        let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
         let candidates = [
             // Relative to executable
             std::env::current_exe()
@@ -434,9 +435,14 @@ impl PackCmd {
             std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.join("lib"))),
-            // Source tree
+            // Source tree dev builds: <exe_dir>/../../lib/linux-<arch>/
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.join(&platform_lib))),
+            // Source tree (CWD)
             Some(PathBuf::from("lib")),
             Some(PathBuf::from("./lib")),
+            Some(PathBuf::from(&platform_lib)),
             // Homebrew
             Some(PathBuf::from("/opt/homebrew/lib")),
             Some(PathBuf::from("/usr/local/lib")),
