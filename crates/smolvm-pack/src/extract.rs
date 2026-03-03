@@ -25,19 +25,58 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
+        let entry_path = entry.path()?.to_path_buf();
 
-        // Reject symlinks, hardlinks, and other special entry types.
-        // Only allow regular files and directories.
         match entry_type {
-            tar::EntryType::Regular | tar::EntryType::GNUSparse => {}
-            tar::EntryType::Directory => {}
+            tar::EntryType::Regular | tar::EntryType::GNUSparse | tar::EntryType::Directory => {}
+            tar::EntryType::Symlink => {
+                // Allow symlinks but validate the target stays within dest.
+                if let Some(link_target) = entry.link_name()? {
+                    let link_target = link_target.to_path_buf();
+                    // Resolve relative symlinks against the entry's parent dir
+                    let resolved = if link_target.is_absolute() {
+                        // Absolute symlinks: jail to dest (e.g., /lib/foo → dest/lib/foo)
+                        dest.join(link_target.strip_prefix("/").unwrap_or(&link_target))
+                    } else {
+                        let parent = entry_path.parent().unwrap_or(Path::new(""));
+                        dest.join(parent).join(&link_target)
+                    };
+                    // Normalize the path by resolving .. components
+                    let normalized = normalize_path(&resolved);
+                    if !normalized.starts_with(&canonical_dest) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar symlink '{}' -> '{}' escapes destination directory",
+                                entry_path.display(),
+                                link_target.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+            tar::EntryType::Link => {
+                // Allow hardlinks but validate the target stays within dest.
+                if let Some(link_target) = entry.link_name()? {
+                    let full_target = dest.join(link_target.as_ref());
+                    let normalized = normalize_path(&full_target);
+                    if !normalized.starts_with(&canonical_dest) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar hardlink '{}' escapes destination directory",
+                                entry_path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
             other => {
-                let path = entry.path()?.to_path_buf();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "tar entry '{}' has disallowed type {:?} (symlinks and hardlinks are rejected)",
-                        path.display(),
+                        "tar entry '{}' has disallowed type {:?}",
+                        entry_path.display(),
                         other
                     ),
                 ));
@@ -45,17 +84,9 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
         }
 
         // Validate that the unpacked path stays within dest.
-        // `entry.path()` returns the path from the tar header; we check
-        // that joining it with dest doesn't escape.
-        let entry_path = entry.path()?.to_path_buf();
         let full_path = dest.join(&entry_path);
-
-        // Normalize by stripping .. components (defense in depth — tar crate
-        // already does this, but we verify).
-        let normalized = full_path
-            .canonicalize()
-            .unwrap_or_else(|_| full_path.clone());
-        if !normalized.starts_with(&canonical_dest) && full_path != dest.join(&entry_path) {
+        let normalized = normalize_path(&full_path);
+        if !normalized.starts_with(&canonical_dest) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -69,6 +100,22 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
         entry.unpack_in(dest)?;
     }
     Ok(())
+}
+
+/// Normalize a path by resolving `.` and `..` components without requiring
+/// the path to exist on disk (unlike `canonicalize()`).
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => components.push(c),
+        }
+    }
+    components.iter().collect()
 }
 
 /// Marker file indicating extraction is complete.
@@ -105,7 +152,7 @@ pub fn sidecar_path_for(exe_path: &Path) -> PathBuf {
 
 /// Extract assets from a sidecar `.smolmachine` file to the cache directory.
 ///
-/// This is the primary extraction function for `smolvm runpack`.
+/// This is the primary extraction function for `smolvm pack run`.
 /// The sidecar file format is: compressed_assets + manifest + footer.
 ///
 /// Uses file-based locking (`flock`) to prevent races when multiple processes
