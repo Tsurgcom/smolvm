@@ -114,14 +114,6 @@ fn main() {
     mount_storage_disk();
     info!(duration_ms = uptime_ms() - t0, "storage disk mounted");
 
-    // Now do initialization - the vsock listener is already accepting at kernel level
-    let t0 = uptime_ms();
-    if let Err(e) = storage::init() {
-        error!(error = %e, "failed to initialize storage");
-        std::process::exit(1);
-    }
-    info!(duration_ms = uptime_ms() - t0, "storage initialized");
-
     // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
     let t0 = uptime_ms();
     if let Some(packed_dir) = storage::get_packed_layers_dir() {
@@ -143,15 +135,10 @@ fn main() {
         );
     }
 
-    // Load and reconcile container registry
-    let t0 = uptime_ms();
-    if let Err(e) = container::REGISTRY.load() {
-        warn!(error = %e, "failed to load container registry, starting fresh");
-    }
-    if let Err(e) = container::REGISTRY.reconcile() {
-        warn!(error = %e, "failed to reconcile container registry");
-    }
-    info!(duration_ms = uptime_ms() - t0, "registry reconciled");
+    // Registry load+reconcile deferred to first container operation via
+    // REGISTRY.ensure_loaded(). On fresh boot, no containers from a previous
+    // instance survive, so this work (~30-50ms for crun list + JSON parse)
+    // is wasted if no container operations are requested.
 
     info!(
         total_startup_ms = uptime_ms() - start_uptime,
@@ -162,8 +149,6 @@ fn main() {
     // Signal readiness to host via virtiofs marker file.
     // The host watches for this file instead of the vsock socket (which appears
     // before the agent is ready, causing wasted timeout on the first ping).
-    // After pivot_root: virtiofs root is at /oldroot, so write there.
-    // Without overlay: virtiofs root is /, so write there.
     signal_ready_to_host();
 
     // Start accepting connections (listener already bound)
@@ -190,7 +175,10 @@ const READY_MARKER_FILENAME: &str = ".smolvm-ready";
 fn signal_ready_to_host() {
     use std::path::Path;
 
-    // Try /oldroot first (overlay mode: virtiofs is the lower layer)
+    let content = uptime_ms().to_string();
+
+    // Try /oldroot first (overlay mode: virtiofs is the lower layer after pivot_root)
+    // Before pivot_root: virtiofs is at /, so the / path works.
     let paths = [
         format!("/oldroot/{}", READY_MARKER_FILENAME),
         format!("/{}", READY_MARKER_FILENAME),
@@ -198,7 +186,7 @@ fn signal_ready_to_host() {
 
     for path in &paths {
         if Path::new(path).parent().map_or(false, |p| p.exists()) {
-            if std::fs::write(path, uptime_ms().to_string().as_bytes()).is_ok() {
+            if std::fs::write(path, content.as_bytes()).is_ok() {
                 debug!(path = path, "ready marker written");
                 return;
             }
@@ -270,6 +258,14 @@ impl MountEntry {
 /// Uses direct syscalls to avoid any overhead.
 #[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
+    // libkrun's init.c mounts /proc, /sys, /dev, /dev/pts before exec'ing
+    // the agent. Skip redundant mounts if already present.
+    if std::path::Path::new("/proc/uptime").exists() {
+        // Ensure /dev/ptmx symlink exists (not set up by init.c)
+        let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
+        return;
+    }
+
     let mounts = [
         MountEntry {
             source: "proc",
@@ -348,6 +344,8 @@ fn setup_persistent_rootfs() {
 
     const OVERLAY_DEVICE: &str = "/dev/vdb";
     const OVERLAY_MOUNT: &str = "/mnt/overlay";
+    const STORAGE_DEVICE: &str = "/dev/vda";
+    const STORAGE_TEMP_MOUNT: &str = "/mnt/storage";
     const NEWROOT: &str = "/mnt/newroot";
 
     // Make root mount private — required for mount --move and pivot_root.
@@ -377,13 +375,13 @@ fn setup_persistent_rootfs() {
     let dev = cstr(OVERLAY_DEVICE);
     let mnt = cstr(OVERLAY_MOUNT);
     let ext4 = cstr("ext4");
-    // SAFETY: mount /dev/vdb as ext4 at /mnt/overlay
+    // SAFETY: mount /dev/vdb as ext4 at /mnt/overlay with noatime
     let mounted = unsafe {
         libc::mount(
             dev.as_ptr(),
             mnt.as_ptr(),
             ext4.as_ptr(),
-            0,
+            libc::MS_NOATIME,
             std::ptr::null(),
         ) == 0
     };
@@ -391,19 +389,19 @@ fn setup_persistent_rootfs() {
     if !mounted {
         // First boot — format the disk
         let _ = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-q", "-L", "smolvm-overlay", OVERLAY_DEVICE])
+            .args(["-F", "-q", "-O", "^has_journal", "-L", "smolvm-overlay", OVERLAY_DEVICE])
             .status();
 
         let dev = cstr(OVERLAY_DEVICE);
         let mnt = cstr(OVERLAY_MOUNT);
         let ext4 = cstr("ext4");
-        // SAFETY: retry mount after formatting
+        // SAFETY: retry mount after formatting with noatime
         if unsafe {
             libc::mount(
                 dev.as_ptr(),
                 mnt.as_ptr(),
                 ext4.as_ptr(),
-                0,
+                libc::MS_NOATIME,
                 std::ptr::null(),
             )
         } != 0
@@ -413,13 +411,41 @@ fn setup_persistent_rootfs() {
         }
     }
 
-    // Expand the ext4 filesystem to fill the block device. The host may have
-    // copied from a small template then extended the sparse file, but the ext4
-    // superblock still reflects the template size. resize2fs fixes this.
-    // Safe to call even when the FS already spans the device (instant no-op).
-    let _ = std::process::Command::new("resize2fs")
-        .arg(OVERLAY_DEVICE)
-        .output();
+    // Expand the ext4 filesystem to fill the block device on first boot.
+    // The host may have copied from a small template then extended the sparse
+    // file. After first resize, the FS spans the full device — skip on
+    // subsequent boots to avoid process spawn overhead (~3-5ms).
+    let resized_marker = format!("{}/.resized", OVERLAY_MOUNT);
+    if !std::path::Path::new(&resized_marker).exists() {
+        let _ = std::process::Command::new("resize2fs")
+            .arg(OVERLAY_DEVICE)
+            .output();
+        let _ = std::fs::write(&resized_marker, "1");
+    }
+
+    // Start storage disk mount in parallel while we set up overlayfs.
+    // The ext4 mount of /dev/vda (~15-20ms) overlaps with overlayfs setup
+    // and overlay dir creation, saving that time from the critical path.
+    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
+        let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
+        Some(std::thread::spawn(|| {
+            let dev = cstr(STORAGE_DEVICE);
+            let mnt = cstr(STORAGE_TEMP_MOUNT);
+            let ext4 = cstr("ext4");
+            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
+            unsafe {
+                libc::mount(
+                    dev.as_ptr(),
+                    mnt.as_ptr(),
+                    ext4.as_ptr(),
+                    libc::MS_NOATIME,
+                    std::ptr::null(),
+                ) == 0
+            }
+        }))
+    } else {
+        None
+    };
 
     // Create overlay directories
     let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
@@ -447,6 +473,15 @@ fn setup_persistent_rootfs() {
     if result != 0 {
         let err = std::io::Error::last_os_error();
         eprintln!("smolvm-agent: failed to mount overlayfs: {}", err);
+        // Clean up parallel storage mount to avoid double-mount in
+        // mount_storage_disk() fallback path.
+        if let Some(handle) = storage_handle {
+            if handle.join().unwrap_or(false) {
+                let mnt = cstr(STORAGE_TEMP_MOUNT);
+                // SAFETY: umount the temp storage mount
+                unsafe { libc::umount(mnt.as_ptr()); }
+            }
+        }
         return;
     }
 
@@ -464,6 +499,28 @@ fn setup_persistent_rootfs() {
                 libc::MS_MOVE,
                 std::ptr::null(),
             );
+        }
+    }
+
+    // Join parallel storage mount and move it into new root.
+    // On subsequent boots, the ext4 mount succeeds and overlaps with the
+    // overlayfs setup above. On first boot, mount fails (disk unformatted)
+    // and mount_storage_disk() handles it with full fsck/mkfs recovery.
+    if let Some(handle) = storage_handle {
+        if handle.join().unwrap_or(false) {
+            let _ = std::fs::create_dir_all(format!("{}/storage", NEWROOT));
+            let src = cstr(STORAGE_TEMP_MOUNT);
+            let dst = cstr(&format!("{}/storage", NEWROOT));
+            // SAFETY: mount --move /mnt/storage to newroot/storage
+            unsafe {
+                libc::mount(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_MOVE,
+                    std::ptr::null(),
+                );
+            }
         }
     }
 
@@ -569,24 +626,43 @@ fn mount_storage_disk() {
 
     // Check if device exists
     if !std::path::Path::new(STORAGE_DEVICE).exists() {
-        // Try to create device node
-        let _ = Command::new("mknod")
-            .args([STORAGE_DEVICE, "b", "253", "0"])
-            .status();
+        // Try to create device node via mknod syscall
+        let dev_path = cstr(STORAGE_DEVICE);
+        // SAFETY: mknod with block device type, major 253 minor 0
+        unsafe {
+            libc::mknod(dev_path.as_ptr(), libc::S_IFBLK | 0o660, libc::makedev(253, 0));
+        }
     }
 
-    // Check if already mounted
+    // Check if already mounted (e.g., pre-mounted during setup_persistent_rootfs)
     if std::path::Path::new(STORAGE_MOUNT).join("layers").exists() {
         debug!("storage already mounted");
         return;
     }
 
-    // Try to mount (disk should be pre-formatted by host)
-    let mount_result = Command::new("mount")
-        .args([STORAGE_DEVICE, STORAGE_MOUNT])
-        .status();
+    /// Mount ext4 using direct syscall with noatime (avoids ~3-5ms fork+exec).
+    fn try_mount_ext4() -> bool {
+        let dev = cstr("/dev/vda");
+        let mnt = cstr("/storage");
+        let ext4 = cstr("ext4");
+        let opts = cstr("noatime");
+        // SAFETY: mount /dev/vda as ext4 at /storage with noatime
+        unsafe {
+            libc::mount(
+                dev.as_ptr(),
+                mnt.as_ptr(),
+                ext4.as_ptr(),
+                libc::MS_NOATIME,
+                opts.as_ptr() as *const libc::c_void,
+            ) == 0
+        }
+    }
 
+    // Skip create_dirs if dirs already exist (subsequent boots).
     let create_dirs = || {
+        if std::path::Path::new(STORAGE_MOUNT).join("layers").exists() {
+            return;
+        }
         let dirs = [
             "layers",
             "configs",
@@ -602,62 +678,66 @@ fn mount_storage_disk() {
         }
     };
 
-    // Expand the ext4 filesystem to fill the block device. The host creates
-    // storage from a 512MB template then extends the sparse file to 20GB, but
-    // the ext4 superblock still thinks the FS is 512MB. resize2fs fixes this.
-    // Safe to call even when the FS already spans the device (instant no-op).
+    // Expand the ext4 filesystem on first boot. After first resize, the FS
+    // spans the full device — skip on subsequent boots to avoid process spawn
+    // overhead (~3-5ms).
     let resize_fs = || {
-        let _ = Command::new("resize2fs").arg(STORAGE_DEVICE).output(); // output() to suppress stdout/stderr
+        let resized_marker = format!("{}/.resized", STORAGE_MOUNT);
+        if !std::path::Path::new(&resized_marker).exists() {
+            let _ = Command::new("resize2fs").arg(STORAGE_DEVICE).output();
+            let _ = std::fs::write(&resized_marker, "1");
+        }
     };
 
-    match mount_result {
-        Ok(status) if status.success() => {
-            debug!("storage disk mounted successfully");
+    // Check /proc/mounts for pre-mounted storage (setup_persistent_rootfs
+    // may have already mounted /dev/vda and moved it to /storage via
+    // mount --move during pivot_root).
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        if mounts.lines().any(|line| line.split_whitespace().nth(1) == Some(STORAGE_MOUNT)) {
+            debug!("storage pre-mounted during rootfs setup");
             resize_fs();
             create_dirs();
+            return;
         }
-        _ => {
-            // Mount failed - try fsck to repair filesystem first
-            warn!("mount failed, attempting filesystem repair with fsck");
-            let fsck_result = Command::new("fsck.ext4")
-                .args(["-y", "-f", STORAGE_DEVICE])
-                .status();
+    }
 
-            match fsck_result {
-                Ok(status) if status.success() || status.code() == Some(1) => {
-                    // fsck succeeded (0) or fixed errors (1) - try mounting again
-                    info!("fsck completed, attempting mount");
-                    let mount_after_fsck = Command::new("mount")
-                        .args([STORAGE_DEVICE, STORAGE_MOUNT])
-                        .status();
+    if try_mount_ext4() {
+        debug!("storage disk mounted successfully");
+        resize_fs();
+        create_dirs();
+    } else {
+        // Mount failed - try fsck to repair filesystem first
+        warn!("mount failed, attempting filesystem repair with fsck");
+        let fsck_result = Command::new("fsck.ext4")
+            .args(["-y", "-f", STORAGE_DEVICE])
+            .status();
 
-                    if let Ok(status) = mount_after_fsck {
-                        if status.success() {
-                            info!("storage disk mounted after fsck repair");
-                            resize_fs();
-                            create_dirs();
-                            return;
-                        }
-                    }
-                    // Mount still failed after fsck, need to format
-                    warn!("mount failed after fsck, formatting storage disk");
+        match fsck_result {
+            Ok(status) if status.success() || status.code() == Some(1) => {
+                // fsck succeeded (0) or fixed errors (1) - try mounting again
+                info!("fsck completed, attempting mount");
+                if try_mount_ext4() {
+                    info!("storage disk mounted after fsck repair");
+                    resize_fs();
+                    create_dirs();
+                    return;
                 }
-                _ => {
-                    // fsck failed - disk might be unformatted (first boot)
-                    info!("fsck failed, assuming first boot - formatting storage disk");
-                }
+                // Mount still failed after fsck, need to format
+                warn!("mount failed after fsck, formatting storage disk");
             }
-
-            // Format as last resort (mkfs creates the FS at full device size,
-            // no resize needed)
-            let _ = Command::new("mkfs.ext4")
-                .args(["-F", "-q", STORAGE_DEVICE])
-                .status();
-            let _ = Command::new("mount")
-                .args([STORAGE_DEVICE, STORAGE_MOUNT])
-                .status();
-            create_dirs();
+            _ => {
+                // fsck failed - disk might be unformatted (first boot)
+                info!("fsck failed, assuming first boot - formatting storage disk");
+            }
         }
+
+        // Format as last resort (mkfs creates the FS at full device size,
+        // no resize needed)
+        let _ = Command::new("mkfs.ext4")
+            .args(["-F", "-q", "-O", "^has_journal", STORAGE_DEVICE])
+            .status();
+        let _ = try_mount_ext4();
+        create_dirs();
     }
 }
 
