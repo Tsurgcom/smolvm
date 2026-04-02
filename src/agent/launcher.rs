@@ -227,7 +227,11 @@ pub fn launch_agent_vm(
             ));
         }
 
-        if resources.network || !port_mappings.is_empty() {
+        let has_egress_policy = resources
+            .allowed_cidrs
+            .as_ref()
+            .is_some_and(|c| !c.is_empty());
+        if resources.network || !port_mappings.is_empty() || has_egress_policy {
             // Add vsock with TSI HIJACK_INET flag to enable network access
             if krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET) < 0 {
                 krun_free_ctx(ctx);
@@ -252,6 +256,51 @@ pub fn launch_agent_vm(
             if krun_set_port_map(ctx, port_ptrs.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
+            }
+
+            // Set egress policy (CIDR-based filtering) if specified.
+            // Resolved via dlsym at runtime for backwards compatibility.
+            if let Some(ref cidrs) = resources.allowed_cidrs {
+                type SetEgressPolicyFn =
+                    unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32;
+
+                let sym_name =
+                    CString::new("krun_set_egress_policy").expect("symbol name is static");
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr());
+                if sym.is_null() {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "set egress policy",
+                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                         Update libkrun or remove --allow-cidr flags.",
+                    ));
+                }
+                #[allow(clippy::missing_transmute_annotations)]
+                let set_egress: SetEgressPolicyFn = std::mem::transmute(sym);
+
+                let mut all_cidrs = cidrs.clone();
+                crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+
+                let cidr_cstrings: Vec<CString> = all_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                    .collect();
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
+
+                if set_egress(ctx, cidr_ptrs.as_ptr()) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "set egress policy",
+                        "krun_set_egress_policy failed",
+                    ));
+                }
+
+                tracing::debug!(
+                    cidr_count = all_cidrs.len(),
+                    "configured egress policy with CIDR filtering"
+                );
             }
 
             tracing::debug!(

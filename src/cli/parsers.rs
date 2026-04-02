@@ -43,3 +43,28 @@ pub fn mounts_to_virtiofs_bindings(mounts: &[HostMount]) -> Vec<(String, String,
         })
         .collect()
 }
+
+/// Parse and validate a CIDR specification (e.g., "10.0.0.0/8", "1.1.1.1").
+///
+/// Accepts `IP/prefix` or bare `IP` (auto-appends /32 for IPv4, /128 for IPv6).
+/// Returns the normalized CIDR string.
+pub fn parse_cidr(s: &str) -> Result<String, String> {
+    use ipnet::IpNet;
+    use std::net::IpAddr;
+
+    // Try parsing as CIDR first, then as bare IP
+    let net: IpNet = match s.parse::<IpNet>() {
+        Ok(net) => net,
+        Err(_) => match s.parse::<IpAddr>() {
+            Ok(ip) => IpNet::from(ip), // bare IP → /32 or /128
+            Err(_) => {
+                return Err(format!(
+                    "invalid CIDR '{}': expected format like 10.0.0.0/8 or 1.1.1.1",
+                    s
+                ))
+            }
+        },
+    };
+
+    Ok(net.to_string())
+}
