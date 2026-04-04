@@ -26,18 +26,29 @@ use std::time::Duration;
 
 const KIND: VmKind = VmKind::Machine;
 
-/// Resolve `--allow-cidr` and `--outbound-localhost-only` into a CIDR list and net flag.
+/// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list and net flag.
+/// Resolution failure for `--allow-host` is a hard error — a typo or DNS outage
+/// should not silently weaken the security policy.
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
+    allow_host: Vec<String>,
     outbound_localhost_only: bool,
     net: bool,
-) -> (Vec<String>, bool) {
+) -> smolvm::Result<(Vec<String>, bool)> {
+    // Resolve hostnames to CIDRs — fail hard on resolution errors
+    for host in &allow_host {
+        let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
+            .map_err(|e| smolvm::Error::config("--allow-host", e))?;
+        tracing::info!(host, ?cidrs, "resolved hostname for egress policy");
+        allow_cidr.extend(cidrs);
+    }
+
     if outbound_localhost_only {
         allow_cidr.push("127.0.0.0/8".to_string());
         allow_cidr.push("::1/128".to_string());
     }
     let net = net || !allow_cidr.is_empty();
-    (allow_cidr, net)
+    Ok((allow_cidr, net))
 }
 
 /// Manage machines
@@ -189,6 +200,10 @@ pub struct RunCmd {
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
 
+    /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
+    pub allow_host: Vec<String>,
+
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
@@ -231,8 +246,12 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let (cli_allow_cidrs, net) =
-            resolve_egress_flags(self.allow_cidr, self.outbound_localhost_only, self.net);
+        let (cli_allow_cidrs, net) = resolve_egress_flags(
+            self.allow_cidr,
+            self.allow_host,
+            self.outbound_localhost_only,
+            self.net,
+        )?;
 
         let params = crate::cli::smolfile::build_create_params(
             "default".to_string(),
@@ -680,6 +699,10 @@ pub struct CreateCmd {
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
 
+    /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME")]
+    pub allow_host: Vec<String>,
+
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long)]
     pub outbound_localhost_only: bool,
@@ -707,8 +730,12 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let (cli_allow_cidrs, net) =
-            resolve_egress_flags(self.allow_cidr, self.outbound_localhost_only, self.net);
+        let (cli_allow_cidrs, net) = resolve_egress_flags(
+            self.allow_cidr,
+            self.allow_host,
+            self.outbound_localhost_only,
+            self.net,
+        )?;
 
         let params = crate::cli::smolfile::build_create_params(
             self.name,

@@ -68,10 +68,6 @@ pub struct Smolfile {
     pub net: Option<bool>,
     pub storage: Option<u64>,
     pub overlay: Option<u64>,
-    /// Allowed egress CIDR ranges (e.g., ["10.0.0.0/8", "1.1.1.1"]).
-    #[serde(default)]
-    pub allowed_cidrs: Vec<String>,
-
     // Legacy top-level fields (will move to [dev] in Step 4)
     #[serde(default)]
     pub ports: Vec<String>,
@@ -85,6 +81,9 @@ pub struct Smolfile {
     pub pack: Option<ArtifactConfig>, // alias for artifact
     pub dev: Option<DevConfig>,
 
+    // Network policy
+    pub network: Option<NetworkConfig>,
+
     // Wired: flows into VmRecord health fields + monitor command
     pub health: Option<HealthConfig>,
     // Wired: flows into VmRecord restart config
@@ -92,6 +91,18 @@ pub struct Smolfile {
 
     // Credential forwarding
     pub auth: Option<AuthConfig>,
+}
+
+/// Network policy — egress filtering by hostname and/or CIDR.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    /// Allowed egress hostnames (resolved to IPs at VM start).
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// Allowed egress CIDR ranges (e.g., ["10.0.0.0/8", "1.1.1.1"]).
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
 }
 
 /// Credential forwarding configuration.
@@ -325,15 +336,30 @@ pub fn build_create_params(
     let storage_gb = cli_storage_gb.or(sf.storage);
     let overlay_gb = cli_overlay_gb.or(sf.overlay);
 
-    // Merge allowed_cidrs: Smolfile first (validated), CLI extends
-    let mut allowed_cidrs_vec: Vec<String> = sf
-        .allowed_cidrs
+    // Merge network policy: [network] section, then CLI extends
+    let network = sf.network.unwrap_or_default();
+
+    // Resolve [network].allow_hosts to CIDRs
+    let mut allowed_cidrs_vec: Vec<String> = Vec::new();
+    for host in &network.allow_hosts {
+        let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
+            .map_err(|e| smolvm::Error::config("smolfile [network] allow_hosts", e))?;
+        allowed_cidrs_vec.extend(cidrs);
+    }
+
+    // Parse [network].allow_cidrs
+    let sf_cidrs: Vec<String> = network
+        .allow_cidrs
         .iter()
         .map(|s| parse_cidr(s))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| smolvm::Error::config("smolfile allowed_cidrs", e))?;
+        .map_err(|e| smolvm::Error::config("smolfile [network] allow_cidrs", e))?;
+    allowed_cidrs_vec.extend(sf_cidrs);
+
+    // CLI extends
     allowed_cidrs_vec.extend(cli_allow_cidr);
-    // --allow-cidr implies --net
+
+    // --allow-cidr / --allow-host / [network] implies --net
     let net = if !allowed_cidrs_vec.is_empty() {
         true
     } else {

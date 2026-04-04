@@ -415,6 +415,69 @@ test_machine_egress_invalid_cidr_rejected() {
     [[ $exit_code -ne 0 ]] && [[ "$output" == *"invalid"* ]]
 }
 
+test_machine_egress_allow_host_permitted() {
+    local vm_name="egress-host-allow-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM allowing only one.one.one.one (resolves to 1.1.1.1)
+    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # DNS lookup to allowed host's IP should succeed
+    local output exit_code=0
+    output=$($SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+test_machine_egress_allow_host_blocked() {
+    local vm_name="egress-host-block-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM allowing only one.one.one.one — 8.8.8.8 should be blocked
+    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    local exit_code=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code -ne 0 ]]
+}
+
+test_machine_egress_allow_host_invalid_rejected() {
+    local vm_name="egress-host-invalid-test-$$"
+    local output exit_code=0
+    output=$($SMOLVM machine create "$vm_name" --allow-host "this-does-not-exist.invalid" 2>&1) || exit_code=$?
+
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Should fail with a resolution error (hard error, not warning)
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"failed to resolve"* ]]
+}
+
+test_machine_egress_allow_host_port_rejected() {
+    local vm_name="egress-host-port-test-$$"
+    local output exit_code=0
+    output=$($SMOLVM machine create "$vm_name" --allow-host "example.com:443" 2>&1) || exit_code=$?
+
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Should fail — port suffixes are not supported
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"port suffixes are not supported"* ]]
+}
+
 # =============================================================================
 # Persistent Rootfs (Overlay)
 # Tests verify that the overlayfs root is active and persists across reboots.
@@ -854,6 +917,10 @@ run_test "Egress: allow-cidr permits matching traffic" test_machine_egress_allow
 run_test "Egress: allow-cidr blocks non-matching traffic" test_machine_egress_allow_cidr_blocked || true
 run_test "Egress: --outbound-localhost-only blocks external" test_machine_egress_outbound_localhost_only || true
 run_test "Egress: invalid CIDR rejected at create" test_machine_egress_invalid_cidr_rejected || true
+run_test "Egress: allow-host permits matching traffic" test_machine_egress_allow_host_permitted || true
+run_test "Egress: allow-host blocks non-matching traffic" test_machine_egress_allow_host_blocked || true
+run_test "Egress: invalid hostname rejected at create" test_machine_egress_allow_host_invalid_rejected || true
+run_test "Egress: host:port syntax rejected" test_machine_egress_allow_host_port_rejected || true
 run_test "Overlay: root is overlayfs" test_machine_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_machine_rootfs_persists_across_reboot || true
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true
