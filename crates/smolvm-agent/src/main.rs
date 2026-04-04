@@ -25,6 +25,7 @@ mod process;
 #[cfg(target_os = "linux")]
 mod pty;
 mod retry;
+mod ssh_agent;
 mod storage;
 mod vsock;
 
@@ -139,6 +140,14 @@ fn main() {
     // REGISTRY.ensure_loaded(). On fresh boot, no containers from a previous
     // instance survive, so this work (~30-50ms for crun list + JSON parse)
     // is wasted if no container operations are requested.
+
+    // Start SSH agent forwarding bridge if enabled by host
+    if ssh_agent::is_enabled() {
+        info!("SSH agent forwarding enabled, starting guest bridge");
+        ssh_agent::start();
+        // Set env so all child processes (git, ssh, etc.) find the agent socket
+        std::env::set_var("SSH_AUTH_SOCK", ssh_agent::GUEST_SSH_AUTH_SOCK);
+    }
 
     info!(
         total_startup_ms = uptime_ms() - start_uptime,
@@ -601,7 +610,7 @@ fn setup_signal_handlers() {
         libc::_exit(0);
     }
 
-    // SAFETY: Setting up signal handlers with valid function pointer
+    // SAFETY: Setting up signal handlers with valid function pointers
     unsafe {
         // Handle SIGTERM (sent by VM stop)
         libc::signal(
@@ -613,6 +622,10 @@ fn setup_signal_handlers() {
             libc::SIGINT,
             handle_term_signal as *const () as libc::sighandler_t,
         );
+        // Note: We do NOT install a SIGCHLD handler here because it would
+        // race with Child::wait() in synchronous exec paths. Instead,
+        // background exec children are reaped by reap_background_children()
+        // called periodically in the accept loop.
     }
 }
 
@@ -770,6 +783,9 @@ fn run_server_with_listener(
     info!(uptime_ms = uptime_ms(), "entering vsock accept loop");
 
     loop {
+        // Reap any exited background children to prevent zombie accumulation
+        reap_background_children();
+
         match listener.accept() {
             Ok(mut stream) => {
                 if first_connection {
@@ -1019,6 +1035,15 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             }
         }
 
+        // VM-level background exec — spawn and return PID immediately
+        AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            background: true,
+            ..
+        } => handle_vm_exec_background(&command, &env, workdir.as_deref()),
+
         // VM-level exec (direct command execution in VM, not container)
         AgentRequest::VmExec {
             command,
@@ -1027,6 +1052,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             timeout_ms,
             interactive: false,
             tty: false,
+            ..
         } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms),
 
         AgentRequest::VmExec { .. } => {
@@ -2174,6 +2200,76 @@ fn handle_storage_status() -> AgentResponse {
 
 /// Handle VM-level exec (non-interactive).
 /// Executes command directly in the VM's rootfs without any container isolation.
+/// Reap any exited background children to prevent zombie accumulation.
+///
+/// Called periodically in the accept loop. Uses `waitpid(-1, WNOHANG)`
+/// to collect all exited children without blocking. Safe to call even
+/// when no background children exist.
+#[cfg(target_os = "linux")]
+fn reap_background_children() {
+    loop {
+        let ret = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if ret <= 0 {
+            break;
+        }
+        debug!(pid = ret, "reaped background child");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_background_children() {}
+
+/// Handle background VM exec — spawn and return PID immediately.
+///
+/// The process runs detached from the agent's control. stdout/stderr
+/// go to /dev/null. Zombie children are reaped by reap_background_children()
+/// in the accept loop.
+fn handle_vm_exec_background(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+) -> AgentResponse {
+    info!(command = ?command, "background VM exec");
+
+    if command.is_empty() {
+        return AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST);
+    }
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
+
+    // Detach: stdout/stderr to /dev/null so the process doesn't block on pipe writes
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.stdin(Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            // Don't wait — let the child run independently.
+            // reap_background_children() in the accept loop collects the exit status.
+            std::mem::forget(child);
+            info!(pid = pid, "background process started");
+            AgentResponse::Completed {
+                exit_code: 0,
+                stdout: format!("{}", pid),
+                stderr: String::new(),
+            }
+        }
+        Err(e) => AgentResponse::error(
+            format!("failed to spawn background command: {}", e),
+            error_codes::SPAWN_FAILED,
+        ),
+    }
+}
+
 fn handle_vm_exec(
     command: &[String],
     env: &[(String, String)],
@@ -2213,50 +2309,47 @@ fn handle_vm_exec(
         }
     };
 
-    // Handle timeout
+    // Drain stdout and stderr concurrently in background threads to prevent
+    // pipe deadlock. Without this, a child writing >64KB to stderr blocks on
+    // write() while the agent blocks waiting for the child to exit — neither
+    // side makes progress. See docs/exec-streaming-unification.md for the
+    // long-term fix (streaming exec).
+    const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
+    let stdout_handle = child.stdout.take().map(|out| {
+        std::thread::Builder::new()
+            .name("exec-stdout".into())
+            .spawn(move || {
+                let mut buf = String::new();
+                let _ = out.take(MAX_OUTPUT as u64).read_to_string(&mut buf);
+                buf
+            })
+    });
+
+    let stderr_handle = child.stderr.take().map(|err| {
+        std::thread::Builder::new()
+            .name("exec-stderr".into())
+            .spawn(move || {
+                let mut buf = String::new();
+                let _ = err.take(MAX_OUTPUT as u64).read_to_string(&mut buf);
+                buf
+            })
+    });
+
+    // Wait for exit with timeout
     let deadline =
         timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
 
-    loop {
-        // Check if process has exited
+    let exit_code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited, collect output (capped at 16 MiB to prevent OOM)
-                const MAX_OUTPUT: usize = 16 * 1024 * 1024;
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-
-                if let Some(out) = child.stdout.take() {
-                    let _ = out.take(MAX_OUTPUT as u64).read_to_string(&mut stdout);
-                }
-                if let Some(err) = child.stderr.take() {
-                    let _ = err.take(MAX_OUTPUT as u64).read_to_string(&mut stderr);
-                }
-
-                return AgentResponse::Completed {
-                    exit_code: status.code().unwrap_or(-1),
-                    stdout,
-                    stderr,
-                };
-            }
+            Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {
-                // Still running, check timeout
                 if let Some(deadline) = deadline {
                     if std::time::Instant::now() >= deadline {
-                        // Timeout - kill process
                         warn!("VM exec command timed out, killing process");
-                        if let Err(e) = child.kill() {
-                            warn!(error = %e, "failed to kill timed out process");
-                        }
-                        // Wait to reap the process and avoid zombies
-                        if let Err(e) = child.wait() {
-                            warn!(error = %e, "failed to wait for killed process");
-                        }
-                        return AgentResponse::Completed {
-                            exit_code: 124, // Standard timeout exit code
-                            stdout: String::new(),
-                            stderr: "command timed out".to_string(),
-                        };
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break 124; // Standard timeout exit code
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(PROCESS_POLL_INTERVAL_MS));
@@ -2268,6 +2361,22 @@ fn handle_vm_exec(
                 );
             }
         }
+    };
+
+    // Join reader threads (they'll finish now that the child has exited or been killed)
+    let stdout = stdout_handle
+        .and_then(|h| h.ok())
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.ok())
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    AgentResponse::Completed {
+        exit_code,
+        stdout,
+        stderr,
     }
 }
 
