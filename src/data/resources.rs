@@ -1,7 +1,11 @@
 /// Default agent VM virtual CPU count.
-pub const DEFAULT_MICROVM_CPU_COUNT: u8 = 1;
+/// vCPU threads sleep in the hypervisor when idle, so over-provisioning
+/// is low-cost — the host OS time-slices them like any other threads.
+pub const DEFAULT_MICROVM_CPU_COUNT: u8 = 4;
 /// Default agent VM memory in MiB.
-pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 512;
+/// Virtio balloon with free page reporting means this is a ceiling, not a
+/// reservation — the host only consumes what the guest actually uses.
+pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 8192;
 
 /// Resources available to a micro vm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

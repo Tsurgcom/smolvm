@@ -18,6 +18,10 @@ smolvm machine exec --name myvm -it -- /bin/sh
 smolvm machine stop --name myvm
 smolvm machine delete myvm
 
+# SSH agent forwarding (git/ssh without exposing keys)
+smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
+smolvm machine create myvm --ssh-agent --net
+
 # Pack into portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-python
 ./my-python run -- python3 -c "print('hello')"
@@ -37,6 +41,8 @@ smolvm container exec --container abc123 -- curl localhost
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Run containers inside a VM | `machine start` → `container create` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
+| Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
+| Minimal VM without container overhead | `smolvm machine run -s Smolfile` (bare VM) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 
 ## CLI Structure
@@ -83,6 +89,7 @@ smolvm config registries edit                     # registry auth
 | `--interactive` | `-i` | run, exec | Keep stdin open |
 | `--tty` | `-t` | run, exec | Allocate pseudo-TTY |
 | `--allow-cidr` | | run, create | CIDR egress filter (implies --net) |
+| `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
 
 ## Smolfile Reference
 
@@ -126,6 +133,10 @@ interval = "10s"
 timeout = "2s"
 retries = 3
 startup_grace = "20s"
+
+# Credential forwarding
+[auth]
+ssh_agent = true                      # forward host SSH agent into the VM
 ```
 
 ### Merge Precedence
@@ -150,6 +161,50 @@ cpus/mem:   CLI flag > Smolfile > defaults (1 CPU, 512 MiB)
 - `--allow-cidr 10.0.0.0/8` enables egress only to specified ranges (implies `--net`)
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP)
+
+## SSH Agent Forwarding
+
+Forward the host's SSH agent into the VM so git, ssh, and scp work with your keys — without the private keys ever entering the VM.
+
+```bash
+# CLI flag
+smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
+smolvm machine create myvm --ssh-agent --net
+
+# Smolfile
+# [auth]
+# ssh_agent = true
+```
+
+Inside the VM, `SSH_AUTH_SOCK` is set automatically. Any tool that uses the SSH agent protocol (git, ssh, scp) works transparently:
+
+```bash
+smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
+smolvm machine exec --name myvm -- ssh deploy@server "systemctl restart app"
+```
+
+The host SSH agent signs challenges but never sends private keys across the boundary. Even with root inside the VM, keys cannot be extracted — this is enforced by the SSH agent protocol and the hypervisor isolation.
+
+Requires `SSH_AUTH_SOCK` to be set on the host. If missing, smolvm exits with an error and remediation instructions.
+
+## Bare VM Mode
+
+`machine run` works without `--image` when a Smolfile provides the workload config, or for direct Alpine shell access:
+
+```bash
+# Bare Alpine shell
+smolvm machine run
+
+# Smolfile with entrypoint/cmd (no container overhead)
+smolvm machine run -s Smolfile
+
+# Bare VM with init setup, detached
+smolvm machine run -d -s Smolfile
+```
+
+Bare VMs run commands directly in the Alpine rootfs via `vm_exec` — no OCI container layer. Use this when you need a minimal Linux environment without image pull overhead.
+
+Note: `machine run -d` with a bare VM workload (entrypoint/cmd) uses background exec. The process runs inside the VM but stdout/stderr are not captured. For long-running services, use `[dev].init` with backgrounding or switch to container mode.
 
 ## Packed Binaries (.smolmachine)
 

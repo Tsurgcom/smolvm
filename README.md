@@ -11,10 +11,9 @@
 smolvm
 ======
 
-A local tool to build and run portable, lightweight, self-contained virtual machines.
+Ship and run software with isolation by default. Sub-second cold start. No dependency management.
 
-Each workload runs in its own Linux microVM with a separate kernel. The host
-filesystem, network, and credentials are isolated unless explicitly shared.
+VMs that feel like a CLI tool. Boot in under 200ms, configure with a Smolfile, ship as a single executable. No daemon, no YAML, no cloud account.
 
 Install
 -------
@@ -29,38 +28,77 @@ Quick Start
 -----------
 
 ```bash
-# Run a command in an ephemeral VM (cleaned up after exit)
-smolvm machine run --image alpine -- echo "hello from a microVM"
+# run a command in an ephemeral VM (cleaned up after exit)
+smolvm machine run --net --image alpine -- echo "hello from a microVM"
 
-# Interactive shell
-smolvm machine run -it --image alpine
+# interactive shell
+smolvm machine run --net -it --image alpine
+```
 
-# Persistent machine (survives stop/start)
+Use This For
+------------
+
+**Sandbox untrusted code** — run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
+
+```bash
+smolvm machine run --image alpine -- sh -c "pip install sketchy-package"
+# runs in its own kernel — can't touch your host filesystem or network
+```
+
+**Pack into portable executables** — turn any workload into a self-contained binary.
+
+```bash
+smolvm pack create --image python:3.12-alpine -o ./my-app
+./my-app run -- python3 -c "print('runs anywhere — no dependencies')"
+```
+
+**Persistent machines for development** — create, stop, start. Installed packages survive restarts.
+
+```bash
 smolvm machine create --net myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
 smolvm machine exec --name myvm -it -- /bin/sh
 # try: sl, ls, uname -a — type 'exit' to leave
 smolvm machine stop --name myvm
-
-# Pack into a portable executable
-smolvm pack create --image python:3.12-alpine -o ./my-pythonvm
-./my-pythonvm run -- python3 -c "print('hello from a packed VM')"
 ```
+
+**Use git and SSH without exposing keys** — forward your host SSH agent into the VM. Private keys never enter the guest — the hypervisor enforces this. Requires an SSH agent running on your host (`ssh-add -l` to check).
+
+```bash
+smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
+# lists your host keys, but they can't be extracted from inside the VM
+
+smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
+```
+
+**Declare environments with a Smolfile** — reproducible VM config in a simple TOML file.
+
+```toml
+image = "python:3.12-alpine"
+net = true
+
+[dev]
+init = ["pip install -r requirements.txt"]
+volumes = ["./src:/app"]
+
+[auth]
+ssh_agent = true
+```
+
+```bash
+smolvm machine create myvm -s Smolfile
+smolvm machine start --name myvm
+```
+
+More examples: [python](https://github.com/smol-machines/smolvm/tree/main/examples/python-app) · [node](https://github.com/smol-machines/smolvm/tree/main/examples/node-app) · [doom](https://github.com/smol-machines/smolvm/tree/main/examples/doom-web)
 
 How It Works
 ------------
 
-[libkrun](https://github.com/containers/libkrun) VMM with
-[Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS)
-or KVM (Linux). No daemon — the VMM is a library linked into the binary.
-Custom kernel: [libkrunfw](https://github.com/smol-machines/libkrunfw).
+Each workload gets real hardware isolation — its own kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS) or KVM (Linux). [libkrun](https://github.com/containers/libkrun) VMM with custom kernel: [libkrunfw](https://github.com/smol-machines/libkrunfw). Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
 
-* <200ms boot
-* Single binary, no runtime dependencies
-* Runs OCI container images inside microVMs
-* Packs workloads into portable `.smolmachine` executables
-* Embeddable via Node.js and Python SDKs
+Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest automatically. vCPU threads sleep in the hypervisor when idle, so over-provisioning has near-zero cost. Override with `--cpus` and `--mem`.
 
 Comparison
 ----------
@@ -74,8 +112,6 @@ Comparison
 | macOS native        | Yes | Via Docker VM | Yes (krunkit) | Yes | No | No |
 | Embeddable SDK      | Yes | No | No | No | No | No |
 | Portable artifacts  | `.smolmachine` | Images (need daemon) | No | No | No | No |
-
-Sources: [container isolation](https://www.docker.com/blog/understanding-docker-container-escapes/) · [containerd benchmark](https://github.com/containerd/containerd/issues/4482) · [QEMU boot time](https://wiki.qemu.org/Features/TCG) · [Firecracker](https://firecracker-microvm.github.io/) · [Kata Containers](https://katacontainers.io/) · [Kata boot time](https://github.com/kata-containers/kata-containers/issues/4292) · [Firecracker requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) · [Kata macOS support](https://github.com/kata-containers/kata-containers/issues/243)
 
 Platform Support
 ----------------
@@ -93,6 +129,7 @@ Known Limitations
 * Network is opt-in (`--net` on `machine create`). The default machine has networking enabled. TCP/UDP only, no ICMP.
 * Volume mounts: directories only (no single files).
 * macOS: binary must be signed with Hypervisor.framework entitlements.
+* `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 
 Development
 -----------
@@ -101,7 +138,4 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 > Alpha — APIs may change.
 
-License
--------
-
-Apache-2.0
+[Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)
