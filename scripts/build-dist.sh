@@ -298,21 +298,33 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # Create symlink for compatibility
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
 else
-    # Copy libraries preserving symlinks with -a, or copy files individually
-    if [[ -L "$WORK_LIB_DIR/libkrun.so" ]]; then
-        cp -a "$WORK_LIB_DIR"/libkrun.so* "$DIST_DIR/lib/" 2>/dev/null || \
-            cp "$WORK_LIB_DIR"/libkrun.so* "$DIST_DIR/lib/"
-    else
-        cp "$WORK_LIB_DIR/libkrun.so" "$DIST_DIR/lib/"
-        # Create versioned symlink
-        ln -sf libkrun.so "$DIST_DIR/lib/libkrun.so.1"
-    fi
-    if [[ -L "$WORK_LIB_DIR/libkrunfw.so" ]]; then
-        cp -a "$WORK_LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/" 2>/dev/null || \
-            cp "$WORK_LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/"
-    else
-        cp "$WORK_LIB_DIR/libkrunfw.so"* "$DIST_DIR/lib/"
-    fi
+    # Copy only the current version of each library (resolved via symlinks)
+    # and recreate the symlink chain in the dist directory.
+    for lib_name in libkrun libkrunfw; do
+        local_so="$WORK_LIB_DIR/${lib_name}.so"
+        if [[ ! -e "$local_so" ]]; then
+            echo "Error: ${lib_name}.so not found in $WORK_LIB_DIR"
+            exit 1
+        fi
+        # Resolve to the actual versioned file (e.g. libkrunfw.so -> libkrunfw.so.5 -> libkrunfw.so.5.3.0)
+        real_file="$(readlink -f "$local_so")"
+        real_name="$(basename "$real_file")"
+        cp "$real_file" "$DIST_DIR/lib/$real_name"
+        # Recreate intermediate symlinks (e.g. libkrunfw.so.5 -> libkrunfw.so.5.3.0)
+        cur="$local_so"
+        while [[ -L "$cur" ]]; do
+            link_name="$(basename "$cur")"
+            target="$(readlink "$cur")"
+            target_name="$(basename "$target")"
+            ln -sf "$target_name" "$DIST_DIR/lib/$link_name"
+            # Follow to next level
+            if [[ "$target" == /* ]]; then
+                cur="$target"
+            else
+                cur="$(dirname "$cur")/$target"
+            fi
+        done
+    done
 fi
 
 # Copy init.krun for Linux (required by libkrunfw kernel)
