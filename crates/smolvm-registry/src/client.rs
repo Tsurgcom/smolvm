@@ -11,6 +11,18 @@ use crate::{RegistryError, Result, MANIFEST_MEDIA_TYPE};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use sha2::{Digest, Sha256};
 
+/// Validate that a digest string matches the expected `sha256:<64 hex chars>` format.
+fn validate_digest(digest: &str) -> Result<()> {
+    if let Some(hex_part) = digest.strip_prefix("sha256:") {
+        if hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(());
+        }
+    }
+    Err(RegistryError::InvalidManifest(format!(
+        "invalid digest format: {digest}"
+    )))
+}
+
 /// HTTP client for an OCI Distribution registry.
 pub struct RegistryClient {
     http: reqwest::Client,
@@ -51,6 +63,7 @@ impl RegistryClient {
 
     /// Check if a blob exists. Returns true if HEAD returns 200.
     pub async fn blob_exists(&self, repo: &str, digest: &str) -> Result<bool> {
+        validate_digest(digest)?;
         let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
         let resp = self.request(reqwest::Method::HEAD, &url).send().await?;
         Ok(resp.status() == reqwest::StatusCode::OK)
@@ -94,12 +107,8 @@ impl RegistryClient {
             })?
             .to_string();
 
-        // Resolve relative Location against base URL.
-        let put_url = if location.starts_with("http") {
-            location
-        } else {
-            format!("{}{}", self.base_url, location)
-        };
+        // Resolve Location — validates same-origin for absolute URLs.
+        let put_url = self.resolve_location(&location)?;
 
         // Step 2: PUT the blob data with digest.
         let separator = if put_url.contains('?') { "&" } else { "?" };
@@ -128,6 +137,7 @@ impl RegistryClient {
     /// NOTE: buffers entire blob in memory. For large artifacts, switch to
     /// streaming to disk with digest verification via `AsyncRead`.
     pub async fn pull_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
+        validate_digest(digest)?;
         let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
         let resp = self.request(reqwest::Method::GET, &url).send().await?;
 
@@ -167,6 +177,8 @@ impl RegistryClient {
         size: u64,
         body: reqwest::Body,
     ) -> Result<()> {
+        validate_digest(digest)?;
+
         // Skip if already present.
         if self.blob_exists(repo, digest).await? {
             tracing::debug!(digest = %digest, "blob already exists, skipping upload");
@@ -198,11 +210,8 @@ impl RegistryClient {
             })?
             .to_string();
 
-        let put_url = if location.starts_with("http") {
-            location
-        } else {
-            format!("{}{}", self.base_url, location)
-        };
+        // Resolve Location — validates same-origin for absolute URLs.
+        let put_url = self.resolve_location(&location)?;
 
         let separator = if put_url.contains('?') { "&" } else { "?" };
         let put_url = format!("{}{}digest={}", put_url, separator, digest);
@@ -237,6 +246,7 @@ impl RegistryClient {
         repo: &str,
         digest: &str,
     ) -> Result<impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>> {
+        validate_digest(digest)?;
         let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
         let resp = self.request(reqwest::Method::GET, &url).send().await?;
 
@@ -297,6 +307,41 @@ impl RegistryClient {
         }
 
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Resolve a Location header value against the base URL.
+    ///
+    /// Relative paths are joined to base_url. Absolute URLs are validated
+    /// to ensure they point to the same registry host (prevents SSRF via
+    /// malicious registry redirects).
+    fn resolve_location(&self, location: &str) -> Result<String> {
+        if location.starts_with("http") {
+            // Absolute URL — validate same origin.
+            // Extract host from both URLs for comparison.
+            let loc_host = location
+                .split("//")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .unwrap_or("");
+            let base_host = self
+                .base_url
+                .split("//")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .unwrap_or("");
+
+            if loc_host != base_host {
+                return Err(RegistryError::ApiError {
+                    status: 202,
+                    body: format!(
+                        "Location header points to different host ({loc_host}), expected {base_host}"
+                    ),
+                });
+            }
+            Ok(location.to_string())
+        } else {
+            Ok(format!("{}{}", self.base_url, location))
+        }
     }
 
     /// Build a request with optional auth header.

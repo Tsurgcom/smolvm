@@ -143,7 +143,15 @@ impl RegistryConfig {
                     None
                 })
             })
-            .or_else(|| entry.password.clone())?;
+            .or_else(|| {
+                if entry.password.is_some() {
+                    tracing::warn!(
+                        registry = %registry,
+                        "using plaintext password from config — use password_env instead"
+                    );
+                }
+                entry.password.clone()
+            })?;
 
         Some(RegistryAuth {
             username: username.clone(),
