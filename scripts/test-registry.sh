@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-INFRA_DIR="$REPO_DIR/smolmachines-registry"
+INFRA_DIR="$REPO_DIR/smolregistry"
 REGISTRY="localhost:5050"
 TEST_REF="localhost:5050/test-machine:latest"
 SMOLVM="$REPO_DIR/target/debug/smolvm"

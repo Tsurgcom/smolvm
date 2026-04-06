@@ -37,4 +37,4 @@ Cargo.lock
 *.smolmachine
 
 # Registry infrastructure (separate git repo)
-/smolmachines-registry/
+/smolregistry/
