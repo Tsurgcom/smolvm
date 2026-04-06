@@ -1284,4 +1284,30 @@ echo ""
 
 run_test "Streaming exec" test_streaming_exec || true
 
+# =============================================================================
+# Auto-Interactive Detection
+# =============================================================================
+
+test_run_no_command_errors() {
+    # machine run with no command and no -it should error with guidance
+    local result
+    local exit_code=0
+    result=$($SMOLVM machine run 2>&1) || exit_code=$?
+
+    # Should fail with non-zero exit
+    [[ $exit_code -ne 0 ]] || { echo "Should have failed"; return 1; }
+
+    # Should contain usage guidance
+    [[ "$result" == *"no command specified"* ]] || {
+        echo "Missing usage guidance: $result"
+        return 1
+    }
+}
+
+echo ""
+echo "--- Run Without Command ---"
+echo ""
+
+run_test "Run with no command errors" test_run_no_command_errors || true
+
 print_summary "Machine Tests"

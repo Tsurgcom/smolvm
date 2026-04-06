@@ -297,6 +297,20 @@ impl RunCmd {
             }
         }
 
+        // Require an explicit command or -it flag. Without one, /bin/sh hangs
+        // waiting for input — confusing UX. Error early with guidance.
+        let (interactive, tty) =
+            if !self.interactive && !self.tty && !self.detach && self.command.is_empty() {
+                return Err(smolvm::Error::config(
+                    "machine run",
+                    "no command specified.\n\
+                     Use: smolvm machine run -- <command>\n\
+                     Or:  smolvm machine run -it",
+                ));
+            } else {
+                (self.interactive, self.tty)
+            };
+
         let resources = VmResources {
             cpus: params.cpus,
             memory_mib: params.mem,
@@ -469,13 +483,13 @@ impl RunCmd {
                 manager.detach();
                 Ok(())
             } else {
-                let exit_code = if self.interactive || self.tty {
+                let exit_code = if interactive || tty {
                     let config = RunConfig::new(img, command)
                         .with_env(env)
                         .with_workdir(params.workdir.clone())
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
-                        .with_tty(self.tty);
+                        .with_tty(tty);
                     client.run_interactive(config)?
                 } else {
                     let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
@@ -568,13 +582,13 @@ impl RunCmd {
                 manager.detach();
                 Ok(())
             } else {
-                let exit_code = if self.interactive || self.tty {
+                let exit_code = if interactive || tty {
                     client.vm_exec_interactive(
                         command,
                         env,
                         params.workdir.clone(),
                         self.timeout,
-                        self.tty,
+                        tty,
                     )?
                 } else {
                     let (exit_code, stdout, stderr) =
