@@ -61,6 +61,7 @@ use state::ApiState;
         handlers::health::health,
         // Execution
         handlers::exec::exec_command,
+        handlers::exec::exec_stream,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
         // Files
@@ -138,6 +139,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/:id", delete(handlers::machines::delete_machine))
         // Exec routes
         .route("/:id/exec", post(handlers::exec::exec_command))
+        .route("/:id/exec/stream", post(handlers::exec::exec_stream))
         .route("/:id/run", post(handlers::exec::run_command))
         // File I/O routes
         .route("/:id/files/*path", put(handlers::files::upload_file))

@@ -68,6 +68,69 @@ pub async fn exec_command(
     }))
 }
 
+/// Execute a command with streaming output (Server-Sent Events).
+///
+/// Returns real-time stdout/stderr as SSE events. Useful for long-running
+/// commands where buffering the entire output is impractical.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{id}/exec/stream",
+    tag = "Execution",
+    params(
+        ("id" = String, Path, description = "Machine name")
+    ),
+    request_body = ExecRequest,
+    responses(
+        (status = 200, description = "Streaming output (SSE)", content_type = "text/event-stream"),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 500, description = "Execution failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn exec_stream(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ExecRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    validate_command(&req.command)?;
+
+    let entry = state.get_machine(&id)?;
+    ensure_running_and_persist(&state, &id, &entry)
+        .await
+        .map_err(classify_ensure_running_error)?;
+
+    let command = req.command.clone();
+    let env = EnvVar::to_tuples(&req.env);
+    let workdir = req.workdir.clone();
+    let timeout = req.timeout_secs.map(Duration::from_secs);
+
+    // Run streaming exec via the machine client (vsock is synchronous)
+    let events = with_machine_client(&entry, move |c| {
+        c.vm_exec_streaming(command, env, workdir, timeout)
+    })
+    .await?;
+
+    // Convert events to SSE stream
+    let stream = futures_util::stream::iter(events.into_iter().map(|event| {
+        let sse_event = match event {
+            crate::agent::ExecEvent::Stdout(data) => Event::default()
+                .event("stdout")
+                .data(String::from_utf8_lossy(&data)),
+            crate::agent::ExecEvent::Stderr(data) => Event::default()
+                .event("stderr")
+                .data(String::from_utf8_lossy(&data)),
+            crate::agent::ExecEvent::Exit(code) => Event::default()
+                .event("exit")
+                .data(format!("{{\"exitCode\":{}}}", code)),
+            crate::agent::ExecEvent::Error(msg) => Event::default()
+                .event("error")
+                .data(format!("{{\"message\":\"{}\"}}", msg)),
+        };
+        Ok(sse_event)
+    }));
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 /// Run a command in an image.
 ///
 /// This creates a temporary overlay from the image and runs the command.

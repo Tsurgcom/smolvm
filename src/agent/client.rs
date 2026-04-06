@@ -14,6 +14,19 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+/// Events from a streaming exec session.
+#[derive(Debug, Clone)]
+pub enum ExecEvent {
+    /// Standard output data.
+    Stdout(Vec<u8>),
+    /// Standard error data.
+    Stderr(Vec<u8>),
+    /// Command exited with this code.
+    Exit(i32),
+    /// An error occurred.
+    Error(String),
+}
+
 // ============================================================================
 // Socket Timeout Constants
 // ============================================================================
@@ -1111,6 +1124,77 @@ impl AgentClient {
             AgentResponse::Error { message, .. } => Err(Error::agent("read file", message)),
             _ => Err(Error::agent("read file", "unexpected response")),
         }
+    }
+
+    // ========================================================================
+    // Streaming Exec
+    // ========================================================================
+
+    /// Execute a command with streaming output.
+    ///
+    /// Sends a VmExec request with interactive=true, tty=false. Reads
+    /// Stdout/Stderr/Exited responses and sends them as `ExecEvent` on
+    /// the returned receiver. Blocks the current thread until the command
+    /// finishes — call from a blocking context (e.g., `spawn_blocking`).
+    pub fn vm_exec_streaming(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<ExecEvent>> {
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+
+        self.send(&AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: true,
+            tty: false,
+            background: false,
+        })?;
+
+        // Wait for Started
+        match self.receive()? {
+            AgentResponse::Started => {}
+            AgentResponse::Error { message, .. } => {
+                return Err(Error::agent("streaming exec", message));
+            }
+            _ => return Err(Error::agent("streaming exec", "expected Started")),
+        }
+
+        let mut events = Vec::new();
+
+        loop {
+            match self.receive() {
+                Ok(AgentResponse::Stdout { data }) => {
+                    events.push(ExecEvent::Stdout(data));
+                }
+                Ok(AgentResponse::Stderr { data }) => {
+                    events.push(ExecEvent::Stderr(data));
+                }
+                Ok(AgentResponse::Exited { exit_code }) => {
+                    events.push(ExecEvent::Exit(exit_code));
+                    break;
+                }
+                Ok(AgentResponse::Error { message, .. }) => {
+                    events.push(ExecEvent::Error(message));
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    events.push(ExecEvent::Error(e.to_string()));
+                    break;
+                }
+            }
+        }
+
+        Ok(events)
     }
 
     /// Low-level send without waiting for response (public).

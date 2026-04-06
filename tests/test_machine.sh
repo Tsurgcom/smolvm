@@ -1248,4 +1248,40 @@ echo ""
 
 run_test "File upload and download" test_file_upload_download || true
 
+# =============================================================================
+# Streaming Exec
+# =============================================================================
+
+test_streaming_exec() {
+    # Start a machine, run a command with --stream, verify output arrives
+    $SMOLVM machine stop 2>/dev/null || true
+
+    $SMOLVM machine create stream-test-$$ 2>&1 || return 1
+    run_with_timeout 30 $SMOLVM machine start --name stream-test-$$ 2>&1 || {
+        $SMOLVM machine delete stream-test-$$ -f 2>/dev/null; return 1
+    }
+
+    # Streaming exec — output should contain the echoed text
+    local result
+    result=$(run_with_timeout 15 $SMOLVM machine exec --stream --name stream-test-$$ -- sh -c "echo 'stream-line-1' && echo 'stream-line-2' && echo 'done'" 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; $SMOLVM machine stop --name stream-test-$$ 2>/dev/null; $SMOLVM machine delete stream-test-$$ -f 2>/dev/null; return 1; }
+
+    [[ "$result" == *"stream-line-1"* ]] && [[ "$result" == *"stream-line-2"* ]] && [[ "$result" == *"done"* ]] || {
+        echo "Missing streaming output: $result"
+        $SMOLVM machine stop --name stream-test-$$ 2>/dev/null
+        $SMOLVM machine delete stream-test-$$ -f 2>/dev/null
+        return 1
+    }
+
+    # Cleanup
+    $SMOLVM machine stop --name stream-test-$$ 2>/dev/null
+    $SMOLVM machine delete stream-test-$$ -f 2>/dev/null
+}
+
+echo ""
+echo "--- Streaming Exec ---"
+echo ""
+
+run_test "Streaming exec" test_streaming_exec || true
+
 print_summary "Machine Tests"

@@ -53,6 +53,7 @@ smolvm machine delete NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
 smolvm machine cp SRC DST                         # copy files (host↔VM)
+smolvm machine exec --stream --name NAME -- CMD   # streaming output
 smolvm machine monitor [--name NAME]              # foreground health + restart
 
 smolvm pack create --image IMAGE -o PATH          # package
@@ -194,6 +195,25 @@ smolvm machine cp ./script.py myvm:/workspace/script.py
 smolvm machine cp myvm:/workspace/output.json ./output.json
 ```
 
+## Streaming Exec
+
+Stream command output in real-time instead of buffering:
+
+```bash
+# CLI — prints output as it arrives
+smolvm machine exec --stream --name myvm -- python3 train.py
+
+# API — Server-Sent Events
+POST /api/v1/machines/:name/exec/stream
+Content-Type: application/json
+{"command": ["python3", "train.py"]}
+
+# Response: text/event-stream
+# event: stdout
+# data: Epoch 1/10...
+# event: exit
+# data: {"exitCode":0}
+```
 ## Bare VM Mode
 
 `machine run` works without `--image` when a Smolfile provides the workload config, or for direct Alpine shell access:
@@ -237,6 +257,7 @@ POST   /api/v1/machines/:name/start        Start machine
 POST   /api/v1/machines/:name/stop         Stop machine
 DELETE /api/v1/machines/:name              Delete machine
 POST   /api/v1/machines/:name/exec         Execute command
+POST   /api/v1/machines/:name/exec/stream  Streaming exec (SSE)
 PUT    /api/v1/machines/:name/files/*path  Upload file
 GET    /api/v1/machines/:name/files/*path  Download file
 GET    /api/v1/machines/:name/logs         Stream logs (SSE)

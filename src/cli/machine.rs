@@ -639,6 +639,10 @@ pub struct ExecCmd {
     /// Allocate a pseudo-TTY (use with -i for shells)
     #[arg(short = 't', long)]
     pub tty: bool,
+
+    /// Stream output in real-time (prints as it arrives)
+    #[arg(long)]
+    pub stream: bool,
 }
 
 impl ExecCmd {
@@ -647,6 +651,40 @@ impl ExecCmd {
             vm_common::ensure_running_and_connect(&self.name, vm_common::VmKind::Machine)?;
 
         let env = parse_env_list(&self.env);
+
+        // Streaming mode — print output as it arrives, no buffering
+        if self.stream {
+            let events = client.vm_exec_streaming(
+                self.command.clone(),
+                env,
+                self.workdir.clone(),
+                self.timeout,
+            )?;
+            let mut exit_code = 0;
+            for event in events {
+                match event {
+                    smolvm::agent::ExecEvent::Stdout(data) => {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(&data);
+                        let _ = std::io::stdout().flush();
+                    }
+                    smolvm::agent::ExecEvent::Stderr(data) => {
+                        use std::io::Write;
+                        let _ = std::io::stderr().write_all(&data);
+                        let _ = std::io::stderr().flush();
+                    }
+                    smolvm::agent::ExecEvent::Exit(code) => {
+                        exit_code = code;
+                    }
+                    smolvm::agent::ExecEvent::Error(msg) => {
+                        eprintln!("error: {}", msg);
+                        exit_code = 1;
+                    }
+                }
+            }
+            manager.detach();
+            std::process::exit(exit_code);
+        }
 
         // Check if this machine has an image — if so, exec inside the image's
         // rootfs via client.run() instead of bare vm_exec().
