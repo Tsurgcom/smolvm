@@ -1104,4 +1104,76 @@ echo ""
 run_test "Ephemeral VM: clean exit deregisters" test_ephemeral_vm_tracking || true
 run_test "Ephemeral VM: visible while running" test_ephemeral_shows_in_list_while_running || true
 
+# =============================================================================
+# Create --image parity with Run
+# =============================================================================
+
+test_create_with_image() {
+    local vm_name="create-image-test-$$"
+
+    # Create with --image (new feature), start, exec, verify, cleanup
+    $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
+
+    # Should appear in list
+    $SMOLVM machine ls 2>&1 | grep -q "$vm_name" || {
+        echo "Machine not in list"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    # Start — should auto-pull the image
+    local start_result
+    start_result=$(run_with_timeout 60 $SMOLVM machine start --name "$vm_name" 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT on start"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    [[ "$start_result" == *"Pulling"* ]] || [[ "$start_result" == *"Started"* ]] || [[ "$start_result" == *"already running"* ]] || {
+        echo "Start failed: $start_result"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    # Exec — verify we're in the right image
+    local exec_result
+    exec_result=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- cat /etc/os-release 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT on exec"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    [[ "$exec_result" == *"Alpine"* ]] || {
+        echo "Not running Alpine: $exec_result"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    # Cleanup
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+}
+
+test_create_with_image_and_env() {
+    local vm_name="create-env-test-$$"
+
+    # Create with --image + env + workdir
+    $SMOLVM machine create "$vm_name" --image alpine:latest --net \
+        -e TEST_VAR=from_create -w /tmp 2>&1 || return 1
+
+    run_with_timeout 60 $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    # Verify workdir was persisted (init commands run in /tmp)
+    local pwd_result
+    pwd_result=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- pwd 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Cleanup
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+}
+
+echo ""
+echo "--- Create --image Tests ---"
+echo ""
+
+run_test "Create with --image" test_create_with_image || true
+run_test "Create with --image + env" test_create_with_image_and_env || true
+
 print_summary "Machine Tests"

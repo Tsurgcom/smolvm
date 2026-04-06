@@ -693,6 +693,10 @@ pub struct CreateCmd {
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
 
+    /// Container image (e.g., alpine, python:3.12-alpine)
+    #[arg(short = 'I', long, value_name = "IMAGE")]
+    pub image: Option<String>,
+
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
     pub cpus: u8,
@@ -737,11 +741,11 @@ pub struct CreateCmd {
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
 
-    /// Set environment variable for init commands (can be used multiple times)
+    /// Set environment variable (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Set working directory for init commands
+    /// Set working directory inside the machine
     #[arg(short = 'w', long = "workdir", value_name = "DIR")]
     pub workdir: Option<String>,
 
@@ -769,7 +773,7 @@ impl CreateCmd {
 
         let params = crate::cli::smolfile::build_create_params(
             name,
-            None,   // image: from Smolfile only
+            self.image,
             None,   // entrypoint: from Smolfile only
             vec![], // cmd: from Smolfile only
             self.cpus,
