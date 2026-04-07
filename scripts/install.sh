@@ -511,8 +511,25 @@ uninstall_smolvm() {
         success "Removed pack cache directory $cache_pack_dir"
     fi
 
-    # Note about PATH
+    # Remove libs extraction cache (from packed binary SMOLLIBS)
+    local cache_libs_dir
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        cache_libs_dir="$HOME/Library/Caches/smolvm-libs"
+    else
+        cache_libs_dir="${XDG_CACHE_HOME:-$HOME/.cache}/smolvm-libs"
+    fi
+    if [[ -d "$cache_libs_dir" ]]; then
+        rm -rf "$cache_libs_dir"
+        success "Removed libs cache directory $cache_libs_dir"
+    fi
+
+    # Note about remaining files
     warn "You may want to remove the PATH entry from your shell profile."
+    local config_dir="$HOME/.config/smolvm"
+    if [[ -d "$config_dir" ]]; then
+        warn "Registry credentials preserved at $config_dir"
+        warn "Remove manually if no longer needed: rm -rf $config_dir"
+    fi
 
     success "smolvm has been uninstalled"
 }
