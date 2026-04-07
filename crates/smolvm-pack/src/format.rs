@@ -320,6 +320,27 @@ pub struct PackManifest {
 
     /// Asset inventory - files included in the assets blob.
     pub assets: AssetInventory,
+
+    /// Build metadata for diagnostics and compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_info: Option<BuildInfo>,
+}
+
+/// Build metadata embedded in the manifest for diagnostics.
+///
+/// All fields are informational — the binary format version in the footer
+/// is what enforces compatibility. This metadata helps with debugging
+/// ("which smolvm built this?") and artifact inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildInfo {
+    /// smolvm version that created the artifact (e.g., "0.5.2").
+    pub smolvm_version: String,
+
+    /// Unix epoch seconds when the artifact was created.
+    pub created_at: String,
+
+    /// Host platform that created the artifact (e.g., "darwin/arm64").
+    pub host_platform: String,
 }
 
 /// Inventory of assets included in the packed binary.
@@ -368,8 +389,32 @@ pub struct LayerEntry {
     pub size: u64,
 }
 
+impl BuildInfo {
+    /// Create build info with the current smolvm version and timestamp.
+    pub fn current() -> Self {
+        let host_platform = format!(
+            "{}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let created_at = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Simple ISO 8601-ish format without pulling in chrono
+            format!("{}", now)
+        };
+        Self {
+            smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
+            created_at,
+            host_platform,
+        }
+    }
+}
+
 impl PackManifest {
-    /// Create a new manifest with default values.
+    /// Create a new manifest with default values and current build info.
     pub fn new(image: String, digest: String, platform: String) -> Self {
         Self {
             mode: PackMode::default(),
@@ -392,6 +437,7 @@ impl PackManifest {
                 storage_template: None,
                 overlay_template: None,
             },
+            build_info: Some(BuildInfo::current()),
         }
     }
 
