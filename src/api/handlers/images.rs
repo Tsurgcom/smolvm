@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use crate::agent::PullOptions;
 use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_running_and_persist, with_machine_client, ApiState};
+use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse,
 };
+use crate::api::TraceId;
 
 /// List images in a machine.
 #[utoipa::path(
@@ -29,7 +30,9 @@ use crate::api::types::{
 pub async fn list_images(
     State(state): State<Arc<ApiState>>,
     Path(machine_id): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
 ) -> Result<Json<ListImagesResponse>, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     let entry = state.get_machine(&machine_id)?;
 
     // Check if machine VM is actually alive, return empty list if not
@@ -40,7 +43,7 @@ pub async fn list_images(
         }
     }
 
-    let images = with_machine_client(&entry, |c| c.list_images()).await?;
+    let images = with_machine_client_traced(&entry, tid, |c| c.list_images()).await?;
 
     let images = images
         .into_iter()
@@ -76,8 +79,10 @@ pub async fn list_images(
 pub async fn pull_image(
     State(state): State<Arc<ApiState>>,
     Path(machine_id): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
     Json(req): Json<PullImageRequest>,
 ) -> Result<Json<PullImageResponse>, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     if req.image.is_empty() {
         return Err(ApiError::BadRequest(
             "image reference cannot be empty".into(),
@@ -93,7 +98,8 @@ pub async fn pull_image(
 
     let image = req.image.clone();
     let oci_platform = req.oci_platform.clone();
-    let image_info = with_machine_client(&entry, move |c| {
+    let start = std::time::Instant::now();
+    let image_info = with_machine_client_traced(&entry, tid, move |c| {
         let mut opts = PullOptions::new().use_registry_config(true);
         if let Some(p) = oci_platform {
             opts = opts.oci_platform(p);
@@ -101,6 +107,7 @@ pub async fn pull_image(
         c.pull(&image, opts)
     })
     .await?;
+    metrics::histogram!("smolvm_image_pull_seconds").record(start.elapsed().as_secs_f64());
 
     Ok(Json(PullImageResponse {
         image: ImageInfo {

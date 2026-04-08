@@ -265,8 +265,23 @@ pub struct HealthResponse {
     #[schema(example = "ok")]
     pub status: &'static str,
     /// Server version.
-    #[schema(example = "0.1.6")]
+    #[schema(example = "0.5.2")]
     pub version: &'static str,
+    /// Machine counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machines: Option<MachineCountsResponse>,
+    /// Server uptime in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_seconds: Option<u64>,
+}
+
+/// Machine counts for health response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MachineCountsResponse {
+    /// Total machines in the database.
+    pub total: usize,
+    /// Currently running machines.
+    pub running: usize,
 }
 
 // ============================================================================

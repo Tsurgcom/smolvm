@@ -666,6 +666,35 @@ pub enum GuestMessage {
 // Wire Format Helpers
 // ============================================================================
 
+/// Envelope that wraps any message with an optional trace ID for correlation.
+///
+/// On the wire, the trace_id is flattened into the JSON alongside the message
+/// fields: `{"trace_id":"abc123","method":"ping"}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope<T> {
+    /// Trace ID for correlating host API requests to agent operations.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace_id: Option<String>,
+    /// The wrapped message.
+    #[serde(flatten)]
+    pub body: T,
+}
+
+impl<T> Envelope<T> {
+    /// Create an envelope with no trace ID.
+    pub fn new(body: T) -> Self {
+        Self {
+            trace_id: None,
+            body,
+        }
+    }
+
+    /// Create an envelope with an optional trace ID.
+    pub fn with_trace_id(body: T, trace_id: Option<String>) -> Self {
+        Self { trace_id, body }
+    }
+}
+
 /// Encode a message to wire format (length-prefixed JSON).
 pub fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, serde_json::Error> {
     let json = serde_json::to_vec(msg)?;
@@ -852,5 +881,59 @@ mod tests {
     fn test_cid_constants() {
         assert_eq!(cid::HOST, 2);
         assert_eq!(cid::GUEST, 3);
+    }
+
+    #[test]
+    fn test_envelope_serialization_with_trace_id() {
+        let req = AgentRequest::Ping;
+        let envelope = Envelope::with_trace_id(&req, Some("abc123".to_string()));
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        // trace_id should be flattened alongside the method tag
+        assert!(json.contains("\"trace_id\":\"abc123\""));
+        assert!(json.contains("\"method\":\"ping\""));
+
+        // Deserialize back — Envelope<AgentRequest> with flatten
+        let parsed: Envelope<AgentRequest> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.trace_id.as_deref(), Some("abc123"));
+        assert!(matches!(parsed.body, AgentRequest::Ping));
+    }
+
+    #[test]
+    fn test_envelope_without_trace_id() {
+        let req = AgentRequest::Ping;
+        let envelope = Envelope::new(&req);
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        // No trace_id field (skip_serializing_if = None)
+        assert!(!json.contains("trace_id"));
+        assert!(json.contains("\"method\":\"ping\""));
+    }
+
+    #[test]
+    fn test_envelope_backward_compat_bare_request() {
+        // A bare AgentRequest (no Envelope) should fail to parse as Envelope
+        // but succeed as bare AgentRequest — this is the agent's fallback path
+        let bare_json = r#"{"method":"ping"}"#;
+
+        // Envelope parse should fail (no body field to flatten into)
+        // Actually with flatten, this may work — let's verify
+        let envelope_result = serde_json::from_str::<Envelope<AgentRequest>>(bare_json);
+        let bare_result = serde_json::from_str::<AgentRequest>(bare_json);
+
+        // At least one must succeed for backward compat
+        assert!(
+            envelope_result.is_ok() || bare_result.is_ok(),
+            "Neither Envelope nor bare parse succeeded"
+        );
+
+        // Bare parse must always work
+        assert!(bare_result.is_ok());
+        assert!(matches!(bare_result.unwrap(), AgentRequest::Ping));
+
+        // If Envelope works, trace_id should be None
+        if let Ok(env) = envelope_result {
+            assert!(env.trace_id.is_none());
+        }
     }
 }

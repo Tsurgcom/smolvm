@@ -878,6 +878,8 @@ impl AgentManager {
         ports: &[PortMapping],
         resources: &VmResources,
     ) -> Result<()> {
+        let boot_start = std::time::Instant::now();
+
         // Store child process handle
         {
             let mut inner = self.inner.lock();
@@ -901,7 +903,14 @@ impl AgentManager {
             Ok(_) => {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
-                tracing::info!(pid = child_pid, "agent VM is ready");
+                let boot_secs = boot_start.elapsed().as_secs_f64();
+                metrics::histogram!("smolvm_vm_boot_seconds").record(boot_secs);
+                metrics::gauge!("smolvm_machines_running").increment(1.0);
+                tracing::info!(
+                    pid = child_pid,
+                    boot_ms = boot_secs * 1000.0,
+                    "agent VM is ready"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -1357,6 +1366,7 @@ impl AgentManager {
         }
 
         self.cleanup_marker_files();
+        metrics::gauge!("smolvm_machines_running").decrement(1.0);
 
         Ok(())
     }

@@ -6,7 +6,7 @@
 use crate::error::{Error, Result};
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use smolvm_protocol::{
-    encode_message, AgentRequest, AgentResponse, ImageInfo, OverlayInfo, StorageStatus,
+    encode_message, AgentRequest, AgentResponse, Envelope, ImageInfo, OverlayInfo, StorageStatus,
     MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
@@ -271,6 +271,8 @@ fn is_benign_shutdown_error(error_str: &str) -> bool {
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
     stream: UnixStream,
+    /// Trace ID for correlating this client session's requests with host API calls.
+    trace_id: Option<String>,
 }
 
 // ============================================================================
@@ -409,7 +411,16 @@ impl AgentClient {
             .set_write_timeout(Some(Duration::from_millis(write_ms)))
             .map_err(|e| Error::agent("set write timeout", e.to_string()))?;
 
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            trace_id: None,
+        })
+    }
+
+    /// Set a trace ID for correlating this client session's requests with host API calls.
+    /// All subsequent requests will include this trace_id in the Envelope.
+    pub fn set_trace_id(&mut self, trace_id: String) {
+        self.trace_id = Some(trace_id);
     }
 
     /// Send a request and receive a response.
@@ -1182,8 +1193,10 @@ impl AgentClient {
     }
 
     /// Low-level send without waiting for response.
+    /// Wraps the request in an Envelope with the current trace_id.
     fn send(&mut self, request: &AgentRequest) -> Result<()> {
-        let json = serde_json::to_vec(request)
+        let envelope = Envelope::with_trace_id(request, self.trace_id.clone());
+        let json = serde_json::to_vec(&envelope)
             .map_err(|e| Error::agent("serialize request", e.to_string()))?;
         let len = json.len() as u32;
 

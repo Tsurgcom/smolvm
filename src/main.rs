@@ -83,12 +83,27 @@ fn main() {
 }
 
 /// Initialize the tracing subscriber.
+///
+/// JSON mode is enabled via `SMOLVM_LOG_FORMAT=json` env var or when
+/// running as `smolvm serve --json-logs`. Default is human-readable.
 fn init_logging() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("smolvm=warn"));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    let json = std::env::var("SMOLVM_LOG_FORMAT")
+        .map(|v| v == "json")
+        .unwrap_or(false);
+
+    if json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_current_span(true)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
 }

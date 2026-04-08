@@ -9,7 +9,7 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    error_codes, ports, AgentRequest, AgentResponse, RegistryAuth, LAYER_CHUNK_SIZE,
+    error_codes, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth, LAYER_CHUNK_SIZE,
     PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
@@ -18,6 +18,22 @@ use std::process::{Child, Command, Stdio};
 use tracing::{debug, error, info, warn};
 
 mod crun;
+
+/// Format a structured JSON log line for early boot (before tracing is up).
+fn format_boot_log(level: &str, msg: &str) -> String {
+    let escaped = serde_json::to_string(msg).unwrap_or_else(|_| format!("\"{}\"", msg));
+    format!(
+        r#"{{"level":"{}","message":{},"target":"smolvm_agent::boot"}}"#,
+        level, escaped
+    )
+}
+
+/// Write a structured JSON log line to stderr during early boot,
+/// before tracing_subscriber is initialized. This keeps
+/// agent-console.log as valid JSON throughout.
+fn boot_log(level: &str, msg: &str) {
+    eprintln!("{}", format_boot_log(level, msg));
+}
 mod dns_proxy;
 mod oci;
 mod paths;
@@ -86,18 +102,21 @@ fn main() {
     let listener = match vsock::listen(ports::AGENT_CONTROL) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("smolvm-agent: FAILED to create vsock listener: {}", e);
+            boot_log("ERROR", &format!("FAILED to create vsock listener: {}", e));
             std::process::exit(1);
         }
     };
 
     let start_uptime = uptime_ms();
 
-    // Initialize logging (after vsock listener is ready)
+    // Initialize logging (after vsock listener is ready).
+    // JSON format for machine consumption (agent-console.log is read by host).
+    // Default level: info — captures lifecycle events without debug noise.
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("smolvm_agent=warn".parse().expect("valid directive")),
+                .add_directive("smolvm_agent=info".parse().expect("valid directive")),
         )
         .init();
 
@@ -429,7 +448,7 @@ fn setup_persistent_rootfs() {
             )
         } != 0
         {
-            eprintln!("smolvm-agent: failed to mount overlay disk after formatting");
+            boot_log("ERROR", "failed to mount overlay disk after formatting");
             return;
         }
     }
@@ -502,7 +521,7 @@ fn setup_persistent_rootfs() {
     };
     if result != 0 {
         let err = std::io::Error::last_os_error();
-        eprintln!("smolvm-agent: failed to mount overlayfs: {}", err);
+        boot_log("ERROR", &format!("failed to mount overlayfs: {}", err));
         // Clean up parallel storage mount to avoid double-mount in
         // mount_storage_disk() fallback path.
         if let Some(handle) = storage_handle {
@@ -560,7 +579,7 @@ fn setup_persistent_rootfs() {
     let _ = std::fs::create_dir_all(format!("{}/oldroot", NEWROOT));
 
     if std::env::set_current_dir(NEWROOT).is_err() {
-        eprintln!("smolvm-agent: failed to chdir to new root");
+        boot_log("ERROR", "failed to chdir to new root");
         return;
     }
 
@@ -572,7 +591,7 @@ fn setup_persistent_rootfs() {
     let result = unsafe { libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), oldroot.as_ptr()) };
     if result != 0 {
         let err = std::io::Error::last_os_error();
-        eprintln!("smolvm-agent: pivot_root failed: {}", err);
+        boot_log("ERROR", &format!("pivot_root failed: {}", err));
         return;
     }
 
@@ -868,21 +887,33 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // Read payload
         stream.read_exact(&mut buf[..len])?;
 
-        // Parse request
-        let request: AgentRequest = match serde_json::from_slice(&buf[..len]) {
-            Ok(req) => req,
-            Err(e) => {
-                warn!(error = %e, "invalid request");
-                send_response(
-                    stream,
-                    &AgentResponse::error(
-                        format!("invalid request: {}", e),
-                        error_codes::INVALID_REQUEST,
-                    ),
-                )?;
-                continue;
-            }
+        // Parse request (Envelope wraps the request with an optional trace_id).
+        // Falls back to bare AgentRequest for backward compatibility with old hosts.
+        let (request, trace_id) =
+            match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
+                Ok(env) => (env.body, env.trace_id),
+                Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
+                    Ok(req) => (req, None),
+                    Err(e) => {
+                        warn!(error = %e, "invalid request");
+                        send_response(
+                            stream,
+                            &AgentResponse::error(
+                                format!("invalid request: {}", e),
+                                error_codes::INVALID_REQUEST,
+                            ),
+                        )?;
+                        continue;
+                    }
+                },
+            };
+
+        let _span = if let Some(ref tid) = trace_id {
+            tracing::info_span!("request", trace_id = %tid, method = ?request)
+        } else {
+            tracing::info_span!("request", method = ?request)
         };
+        let _guard = _span.enter();
 
         debug!(?request, "received request");
 
@@ -2705,3 +2736,26 @@ fn send_response(
 /// Trait for read+write streams with raw fd access.
 trait ReadWrite: Read + Write + AsRawFd {}
 impl<T: Read + Write + AsRawFd> ReadWrite for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_boot_log_valid_json() {
+        let line = format_boot_log("ERROR", "something failed");
+        let parsed: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("Invalid JSON: {}\nLine: {}", e, line));
+        assert_eq!(parsed["level"], "ERROR");
+        assert_eq!(parsed["message"], "something failed");
+        assert_eq!(parsed["target"], "smolvm_agent::boot");
+    }
+
+    #[test]
+    fn test_boot_log_escapes_quotes() {
+        let line = format_boot_log("ERROR", r#"failed: "device" not found"#);
+        let parsed: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("Invalid JSON: {}\nLine: {}", e, line));
+        assert!(parsed["message"].as_str().unwrap().contains("\"device\""));
+    }
+}

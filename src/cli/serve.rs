@@ -64,11 +64,20 @@ pub struct ServeStartCmd {
     /// CORS allowed origins (repeatable). Defaults to localhost:8080 and localhost:3000.
     #[arg(long = "cors-origin", value_name = "ORIGIN")]
     cors_origins: Vec<String>,
+
+    /// Output logs as structured JSON (for log aggregators)
+    #[arg(long)]
+    json_logs: bool,
 }
 
 impl ServeStartCmd {
     /// Run the serve command.
     pub fn run(self) -> Result<()> {
+        // Set JSON log format for the logging initializer to pick up
+        if self.json_logs {
+            std::env::set_var("SMOLVM_LOG_FORMAT", "json");
+        }
+
         // Parse listen address
         let addr: SocketAddr = self.listen.parse().map_err(|e| {
             smolvm::error::Error::config(
@@ -104,6 +113,12 @@ impl ServeStartCmd {
             eprintln!("         The API has no authentication - any network client can control this host.");
             eprintln!("         Consider using --listen 127.0.0.1:8080 for local-only access.");
         }
+
+        // Install Prometheus metrics recorder and mark start time
+        if let Some(handle) = smolvm::api::install_metrics_recorder() {
+            let _ = smolvm::api::METRICS_HANDLE.set(handle);
+        }
+        smolvm::api::handlers::health::mark_server_start();
 
         // Create shared state and load persisted machines
         let state = Arc::new(ApiState::new().map_err(|e| {
