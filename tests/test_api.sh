@@ -296,4 +296,99 @@ echo ""
 
 run_test "API: auto-generated names" test_api_auto_generated_names || true
 
+# =============================================================================
+# Observability (Trace ID correlation)
+# Tests verify that the API server returns trace IDs and they propagate
+# through to the agent for end-to-end request correlation.
+# =============================================================================
+
+test_trace_id_in_response_header() {
+    # Every API response should have an X-Trace-Id header
+    local headers
+    headers=$(curl -sI "$API_URL/health" 2>&1)
+    echo "$headers" | grep -qi "x-trace-id" || { echo "Missing X-Trace-Id header"; return 1; }
+
+    # Trace ID should be a hex string
+    local trace_id
+    trace_id=$(echo "$headers" | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
+    [[ "$trace_id" =~ ^[0-9a-f]{16}$ ]] || { echo "Invalid trace_id format: '$trace_id'"; return 1; }
+}
+
+test_trace_id_unique_per_request() {
+    # Two requests should get different trace IDs
+    local tid1 tid2
+    tid1=$(curl -sI "$API_URL/health" 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
+    tid2=$(curl -sI "$API_URL/health" 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
+
+    [[ -n "$tid1" ]] && [[ -n "$tid2" ]] && [[ "$tid1" != "$tid2" ]] || {
+        echo "Trace IDs not unique: '$tid1' vs '$tid2'"
+        return 1
+    }
+}
+
+echo ""
+echo "--- Observability Tests ---"
+echo ""
+
+run_test "Trace ID: present in response header" test_trace_id_in_response_header || true
+run_test "Trace ID: unique per request" test_trace_id_unique_per_request || true
+
+test_trace_id_end_to_end() {
+    # Create and start a machine via API
+    local vm_name="trace-e2e-test-$$"
+    curl -sf -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$vm_name\", \"cpus\": 1, \"memoryMb\": 512}" >/dev/null 2>&1 || return 1
+    curl -sf -X POST "$API_URL/api/v1/machines/$vm_name/start" >/dev/null 2>&1 || {
+        curl -sf -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null 2>&1
+        return 1
+    }
+
+    # Exec a command and capture the trace ID from the response header
+    local trace_id
+    trace_id=$(curl -sD - -X POST "$API_URL/api/v1/machines/$vm_name/exec" \
+        -H "Content-Type: application/json" \
+        -d '{"command": ["echo", "trace-e2e"]}' 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
+
+    # Cleanup
+    curl -sf -X POST "$API_URL/api/v1/machines/$vm_name/stop" >/dev/null 2>&1
+    curl -sf -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null 2>&1
+
+    # Verify we got a trace ID back
+    [[ -n "$trace_id" ]] || { echo "No trace ID returned from exec"; return 1; }
+    [[ "$trace_id" =~ ^[0-9a-f]{16}$ ]] || { echo "Invalid trace ID: '$trace_id'"; return 1; }
+
+    echo "End-to-end trace ID: $trace_id"
+}
+
+run_test "Trace ID: end-to-end with running VM" test_trace_id_end_to_end || true
+
+test_metrics_endpoint() {
+    local response
+    response=$(curl -s "$API_URL/metrics" 2>&1)
+
+    # Should return Prometheus text format
+    [[ -n "$response" ]] || { echo "Empty metrics response"; return 1; }
+
+    # After making requests, the counter should exist
+    echo "$response" | grep -q "smolvm_api_requests_total" || { echo "Missing request counter"; return 1; }
+}
+
+test_health_enriched() {
+    local response
+    response=$(curl -s "$API_URL/health" 2>&1)
+
+    # Should have version
+    echo "$response" | grep -q '"version"' || { echo "Missing version"; return 1; }
+
+    # Should have machine counts
+    echo "$response" | grep -q '"machines"' || { echo "Missing machines"; return 1; }
+
+    # Should have uptime
+    echo "$response" | grep -q '"uptime_seconds"' || { echo "Missing uptime"; return 1; }
+}
+
+run_test "Prometheus: /metrics endpoint" test_metrics_endpoint || true
+run_test "Health: enriched response" test_health_enriched || true
+
 print_summary "HTTP API Tests"

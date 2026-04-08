@@ -12,11 +12,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_running_and_persist, with_machine_client, ApiState};
+use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
 use crate::api::types::{
     ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
 };
 use crate::api::validation::validate_command;
+use crate::api::TraceId;
 use crate::data::consts::BYTES_PER_MIB;
 use crate::data::storage::HostMount;
 use tokio::sync::Semaphore;
@@ -42,8 +43,10 @@ use tokio::sync::Semaphore;
 pub async fn exec_command(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
@@ -58,8 +61,12 @@ pub async fn exec_command(
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
-    let (exit_code, stdout, stderr) =
-        with_machine_client(&entry, move |c| c.vm_exec(command, env, workdir, timeout)).await?;
+    let start = std::time::Instant::now();
+    let (exit_code, stdout, stderr) = with_machine_client_traced(&entry, tid, move |c| {
+        c.vm_exec(command, env, workdir, timeout)
+    })
+    .await?;
+    metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
 
     Ok(Json(ExecResponse {
         exit_code,
@@ -89,8 +96,10 @@ pub async fn exec_command(
 pub async fn exec_stream(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
@@ -104,7 +113,7 @@ pub async fn exec_stream(
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Run streaming exec via the machine client (vsock is synchronous)
-    let events = with_machine_client(&entry, move |c| {
+    let events = with_machine_client_traced(&entry, tid, move |c| {
         c.vm_exec_streaming(command, env, workdir, timeout)
     })
     .await?;
@@ -152,8 +161,10 @@ pub async fn exec_stream(
 pub async fn run_command(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
     Json(req): Json<RunRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
@@ -183,7 +194,7 @@ pub async fn run_command(
             .collect::<Vec<_>>()
     };
 
-    let (exit_code, stdout, stderr) = with_machine_client(&entry, move |c| {
+    let (exit_code, stdout, stderr) = with_machine_client_traced(&entry, tid, move |c| {
         c.run_with_mounts_and_timeout(&image, command, env, workdir, mounts_config, timeout)
     })
     .await?;

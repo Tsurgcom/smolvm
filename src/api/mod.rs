@@ -24,6 +24,10 @@ pub mod types;
 pub mod validation;
 
 use axum::{
+    extract::Request,
+    http::HeaderValue,
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post, put},
     Router,
 };
@@ -206,12 +210,84 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
+    // Prometheus metrics
+    let metrics_route = Router::new().route("/metrics", get(serve_metrics));
+
     // Combine all routes
     Router::new()
         .merge(health_route)
+        .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .layer(middleware::from_fn(trace_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+/// Install the global Prometheus metrics recorder.
+/// Returns None if a recorder is already installed (e.g., in tests).
+pub fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .ok()
+}
+
+/// Serve Prometheus metrics as text.
+async fn serve_metrics() -> String {
+    METRICS_HANDLE.get().map(|h| h.render()).unwrap_or_default()
+}
+
+/// Global handle to the Prometheus recorder, set once at startup.
+/// Only accessed by serve.rs (startup) and serve_metrics (handler).
+pub static METRICS_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+    std::sync::OnceLock::new();
+
+/// Normalize a request path for Prometheus labels.
+/// Replaces machine IDs with `:id` to prevent cardinality explosion.
+fn normalize_metrics_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 4 && parts[1] == "api" && parts[3] == "machines" {
+        if let Some(id_pos) = parts.get(4) {
+            if !id_pos.is_empty() {
+                let mut normalized = parts[..4].to_vec();
+                normalized.push(":id");
+                normalized.extend_from_slice(&parts[5..]);
+                return normalized.join("/");
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Trace ID for correlating API requests to agent operations.
+#[derive(Clone, Debug)]
+pub struct TraceId(pub String);
+
+/// Middleware that generates a unique trace ID for each request and returns it
+/// in the `X-Trace-Id` response header.
+async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing::Instrument;
+
+    static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let trace_id = format!("{:08x}{:08x}", seq, std::process::id());
+
+    req.extensions_mut().insert(TraceId(trace_id.clone()));
+
+    let method = req.method().to_string();
+    // Normalize path to template to avoid cardinality explosion from machine IDs
+    let path_template = normalize_metrics_path(req.uri().path());
+
+    let span = tracing::info_span!("request", trace_id = %trace_id);
+    let mut response = next.run(req).instrument(span).await;
+
+    let status = response.status().as_u16().to_string();
+    metrics::counter!("smolvm_api_requests_total", "method" => method, "status" => status, "path" => path_template).increment(1);
+
+    if let Ok(val) = HeaderValue::from_str(&trace_id) {
+        response.headers_mut().insert("x-trace-id", val);
+    }
+    response
 }

@@ -333,6 +333,22 @@ impl ApiState {
         self.machines.read().contains_key(name)
     }
 
+    /// Return (total, running) machine counts for health endpoint.
+    /// Uses try_lock to avoid blocking on contended machine entries.
+    pub fn machine_counts(&self) -> (usize, usize) {
+        let machines = self.machines.read();
+        let total = machines.len();
+        let running = machines
+            .values()
+            .filter(|e| {
+                e.try_lock()
+                    .map(|entry| entry.manager.is_process_alive())
+                    .unwrap_or(true) // assume running if locked (active operation)
+            })
+            .count();
+        (total, running)
+    }
+
     // ========================================================================
     // Atomic Machine Creation (Reservation Pattern)
     // ========================================================================
@@ -582,8 +598,10 @@ impl ApiState {
 /// Run a blocking operation against a machine's agent client.
 ///
 /// Handles the common pattern: clone entry → spawn_blocking → lock → connect → op → map errors.
-pub async fn with_machine_client<T, F>(
+/// Propagates an optional trace ID to the agent for request correlation.
+pub async fn with_machine_client_traced<T, F>(
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
+    trace_id: Option<String>,
     op: F,
 ) -> Result<T, ApiError>
 where
@@ -594,6 +612,9 @@ where
     tokio::task::spawn_blocking(move || {
         let entry = entry_clone.lock();
         let mut client = entry.manager.connect()?;
+        if let Some(tid) = trace_id {
+            client.set_trace_id(tid);
+        }
         op(&mut client)
     })
     .await?

@@ -1310,4 +1310,63 @@ echo ""
 
 run_test "Run with no command errors" test_run_no_command_errors || true
 
+echo ""
+echo "--- Observability Tests ---"
+echo ""
+
+# =============================================================================
+# Agent Structured Logging
+# Tests verify the agent writes JSON logs to the console log file.
+# =============================================================================
+
+test_agent_json_logs() {
+    local vm_name="observability-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Run a command to generate agent log entries
+    $SMOLVM machine exec --name "$vm_name" -- echo "observability-test" 2>&1 || true
+
+    # Find the console log
+    local data_dir
+    data_dir=$(vm_data_dir "$vm_name")
+    local console_log="${data_dir}/../agent-console.log"
+
+    # Try the runtime dir
+    local runtime_dir
+    runtime_dir=$(find /run/user/$(id -u)/smolvm/vms/"$vm_name" -name "agent-console.log" 2>/dev/null | head -1)
+    if [[ -z "$runtime_dir" ]]; then
+        runtime_dir=$(find "$HOME/.cache/smolvm" -path "*/$vm_name/agent-console.log" 2>/dev/null | head -1)
+    fi
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    if [[ -z "$runtime_dir" ]]; then
+        echo "Console log not found"
+        return 1
+    fi
+
+    # Agent should write JSON — verify at least one line parses as JSON
+    local json_lines
+    json_lines=$(grep -c '^{' "$runtime_dir" 2>/dev/null || echo "0")
+    [[ "$json_lines" -gt 0 ]] || { echo "No JSON lines in console log ($runtime_dir)"; return 1; }
+
+    # Verify a JSON line has expected structured fields
+    local first_json
+    first_json=$(grep '^{' "$runtime_dir" | head -1)
+    echo "$first_json" | python3 -c "
+import sys, json
+line = json.load(sys.stdin)
+assert 'timestamp' in line, 'missing timestamp'
+assert 'level' in line, 'missing level'
+" 2>&1 || { echo "JSON log missing structured fields: $first_json"; return 1; }
+}
+
+run_test "Agent: structured JSON logs" test_agent_json_logs || true
+
 print_summary "Machine Tests"

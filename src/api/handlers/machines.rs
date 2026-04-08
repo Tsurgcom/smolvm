@@ -36,6 +36,7 @@ use crate::api::types::{
 };
 use crate::api::validation::validate_command;
 use crate::api::validation::validate_resource_name;
+use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
 
 /// Maximum machine name length.
@@ -586,8 +587,10 @@ pub async fn delete_machine(
 pub async fn exec_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
     Json(req): Json<MachineExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
 
     // Check if VM exists
@@ -618,6 +621,9 @@ pub async fn exec_machine(
         let mut client = manager
             .connect()
             .map_err(|e| crate::Error::agent("connect", e.to_string()))?;
+        if let Some(tid) = tid {
+            client.set_trace_id(tid);
+        }
         let (exit_code, stdout, stderr) = client
             .vm_exec(command, env, workdir, timeout)
             .map_err(|e| crate::Error::agent("exec", e.to_string()))?;

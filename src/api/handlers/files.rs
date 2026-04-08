@@ -10,7 +10,8 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_running_and_persist, with_machine_client, ApiState};
+use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
+use crate::api::TraceId;
 
 /// Response from file upload.
 #[derive(Debug, Serialize, ToSchema)]
@@ -43,8 +44,10 @@ pub struct FileUploadResponse {
 pub async fn upload_file(
     State(state): State<Arc<ApiState>>,
     Path((id, file_path)): Path<(String, String)>,
+    trace_id: Option<axum::Extension<TraceId>>,
     body: Bytes,
 ) -> Result<Json<FileUploadResponse>, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     let entry = state.get_machine(&id)?;
     ensure_running_and_persist(&state, &id, &entry)
         .await
@@ -53,7 +56,8 @@ pub async fn upload_file(
     let guest_path = format!("/{}", file_path);
     let size = body.len() as u64;
 
-    with_machine_client(&entry, move |c| c.write_file(&guest_path, &body, None)).await?;
+    with_machine_client_traced(&entry, tid, move |c| c.write_file(&guest_path, &body, None))
+        .await?;
 
     Ok(Json(FileUploadResponse {
         path: format!("/{}", file_path),
@@ -81,7 +85,9 @@ pub async fn upload_file(
 pub async fn download_file(
     State(state): State<Arc<ApiState>>,
     Path((id, file_path)): Path<(String, String)>,
+    trace_id: Option<axum::Extension<TraceId>>,
 ) -> Result<Bytes, ApiError> {
+    let tid = trace_id.map(|t| t.0 .0.clone());
     let entry = state.get_machine(&id)?;
     ensure_running_and_persist(&state, &id, &entry)
         .await
@@ -89,7 +95,7 @@ pub async fn download_file(
 
     let guest_path = format!("/{}", file_path);
 
-    let data = with_machine_client(&entry, move |c| c.read_file(&guest_path)).await?;
+    let data = with_machine_client_traced(&entry, tid, move |c| c.read_file(&guest_path)).await?;
 
     Ok(Bytes::from(data))
 }
