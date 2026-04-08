@@ -147,15 +147,20 @@ fn link_libkrun() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib");
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
 
-            // Change the library's install_name to use @rpath and re-sign
-            let lib_path = std::path::Path::new(&bundle_path).join("libkrun.dylib");
-            if lib_path.exists() {
+            // Change the library's install_name to use @rpath.
+            // Copy to OUT_DIR first so we don't modify the source lib/ in-place
+            // (which would mutate the LFS-tracked file and cause size mismatches
+            // when build-dist.sh copies it into the release tarball).
+            let src_lib = std::path::Path::new(&bundle_path).join("libkrun.dylib");
+            if src_lib.exists() {
+                let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+                let dst_lib = out_dir.join("libkrun.dylib");
+                let _ = std::fs::copy(&src_lib, &dst_lib);
                 let _ = Command::new("install_name_tool")
-                    .args(["-id", "@rpath/libkrun.dylib", lib_path.to_str().unwrap()])
+                    .args(["-id", "@rpath/libkrun.dylib", dst_lib.to_str().unwrap()])
                     .status();
-                // Re-sign after modification (macOS requires valid signature)
                 let _ = Command::new("codesign")
-                    .args(["--force", "--sign", "-", lib_path.to_str().unwrap()])
+                    .args(["--force", "--sign", "-", dst_lib.to_str().unwrap()])
                     .status();
             }
         }

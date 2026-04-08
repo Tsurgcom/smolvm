@@ -104,6 +104,28 @@ pub fn find_lib_dir() -> Option<PathBuf> {
     None
 }
 
+/// Log the SHA-256 fingerprint of the libkrun in the given directory.
+/// Only logs at debug level — useful for diagnosing version mismatches
+/// between the statically linked and dynamically loaded libkrun.
+fn debug_lib_fingerprint(lib_dir: &Path) {
+    use sha2::{Digest, Sha256};
+
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let libkrun_path = lib_dir.join(format!("libkrun.{}", ext));
+    if let Ok(data) = std::fs::read(&libkrun_path) {
+        let hash = Sha256::digest(&data);
+        tracing::debug!(
+            path = %libkrun_path.display(),
+            fingerprint = %format!("sha256:{:x}", hash),
+            "libkrun fingerprint (static launcher)"
+        );
+    }
+}
+
 /// Preload libkrunfw with `RTLD_GLOBAL` so libkrun's internal `dlopen("libkrunfw.so.5")` finds it.
 ///
 /// Setting `LD_LIBRARY_PATH` via `std::env::set_var` is insufficient because glibc caches
@@ -117,6 +139,9 @@ fn preload_libkrunfw() {
     let Some(lib_dir) = find_lib_dir() else {
         return;
     };
+
+    // Log library fingerprint for debugging library version mismatches
+    debug_lib_fingerprint(&lib_dir);
 
     let lib_path = lib_dir.join(libkrunfw_filename());
     let Ok(lib_path_c) = CString::new(lib_path.to_string_lossy().as_bytes()) else {

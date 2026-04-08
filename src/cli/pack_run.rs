@@ -72,6 +72,33 @@ fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
     ))
 }
 
+/// Print the SHA-256 fingerprint of the libkrun being used (for debugging).
+fn debug_libkrun_fingerprint(lib_dir: &Path) {
+    use sha2::{Digest, Sha256};
+
+    let dylib_ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let libkrun_path = lib_dir.join(format!("libkrun.{}", dylib_ext));
+    if !libkrun_path.exists() {
+        eprintln!("debug: libkrun not found at {}", libkrun_path.display());
+        return;
+    }
+    match std::fs::read(&libkrun_path) {
+        Ok(data) => {
+            let hash = Sha256::digest(&data);
+            eprintln!(
+                "debug: libkrun fingerprint: sha256:{:x} ({})",
+                hash,
+                libkrun_path.display()
+            );
+        }
+        Err(e) => eprintln!("debug: cannot read libkrun for fingerprint: {}", e),
+    }
+}
+
 /// Convert parsed mounts to PackedMount format for the VM launcher.
 fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMount> {
     mounts
@@ -265,7 +292,9 @@ impl PackRunCmd {
         }
 
         // 5. Extract assets to cache (locked to prevent concurrent extraction races)
-        let cache_dir = extract::get_cache_dir(footer.checksum)
+        let cache_key = extract::compute_sidecar_cache_key(&sidecar_path, &footer)
+            .map_err(|e| Error::agent("compute cache key", e.to_string()))?;
+        let cache_dir = extract::get_cache_dir(&cache_key)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
         extract::extract_sidecar(
@@ -277,12 +306,18 @@ impl PackRunCmd {
         )
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
 
+        // Auto-evict old cache entries to prevent unbounded growth
+        extract::auto_evict(10);
+
         // 6. Set up paths — use a unique runtime directory per invocation so
         //    concurrent runs of the same checksum don't conflict on
         //    storage.ext4 / agent.sock.  tempdir_in gives us a truly unique
         //    directory that survives PID reuse and abrupt termination.
         let rootfs_path = cache_dir.join("agent-rootfs");
         let lib_dir = resolve_lib_dir(&cache_dir, self.debug)?;
+        if self.debug {
+            debug_libkrun_fingerprint(&lib_dir);
+        }
         let layers_dir = cache_dir.join("layers");
         let runtime_parent = cache_dir.join("runtime");
         std::fs::create_dir_all(&runtime_parent)
@@ -961,17 +996,17 @@ fn pack_run_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
         PackedCmd::Run(args) => run_ephemeral(mode, args, debug, force_extract),
         PackedCmd::Start(args) => daemon_start(&mode, args, debug, force_extract),
         PackedCmd::Exec(args) => {
-            let checksum = mode_checksum(&mode);
+            let cache_key = mode_cache_key(&mode)?;
             let manifest = read_manifest_for_mode(&mode)?;
-            daemon_exec(checksum, args, debug, &manifest)
+            daemon_exec(&cache_key, args, debug, &manifest)
         }
         PackedCmd::Stop => {
-            let checksum = mode_checksum(&mode);
-            daemon_stop(checksum, debug)
+            let cache_key = mode_cache_key(&mode)?;
+            daemon_stop(&cache_key, debug)
         }
         PackedCmd::Status => {
-            let checksum = mode_checksum(&mode);
-            daemon_status(checksum)
+            let cache_key = mode_cache_key(&mode)?;
+            daemon_status(&cache_key)
         }
         PackedCmd::Info => {
             let checksum = mode_checksum(&mode);
@@ -1043,14 +1078,15 @@ fn run_ephemeral(
 #[cfg(target_os = "macos")]
 fn run_section_mode(
     manifest: smolvm_pack::PackManifest,
-    checksum: u32,
+    _checksum: u32,
     assets_ptr: *const u8,
     assets_size: usize,
     args: PackedRunArgs,
     debug: bool,
     force_extract: bool,
 ) -> smolvm::Result<()> {
-    let cache_dir = extract::get_cache_dir(checksum)
+    let cache_key = unsafe { extract::compute_section_cache_key(assets_ptr, assets_size) };
+    let cache_dir = extract::get_cache_dir(&cache_key)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
     let needs_extract = force_extract || !extract::is_extracted(&cache_dir);
@@ -1076,7 +1112,9 @@ fn run_embedded_mode(
     let manifest = smolvm_pack::read_manifest(&exe_path)
         .map_err(|e| Error::agent("read manifest", e.to_string()))?;
 
-    let cache_dir = extract::get_cache_dir(footer.checksum)
+    let cache_key = extract::compute_binary_cache_key(&exe_path, &footer)
+        .map_err(|e| Error::agent("compute cache key", e.to_string()))?;
+    let cache_dir = extract::get_cache_dir(&cache_key)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
     let needs_extract = force_extract || !extract::is_extracted(&cache_dir);
@@ -1099,6 +1137,9 @@ fn run_from_cache(
 ) -> smolvm::Result<()> {
     let rootfs_path = cache_dir.join("agent-rootfs");
     let lib_dir = resolve_lib_dir(cache_dir, debug)?;
+    if debug {
+        debug_libkrun_fingerprint(&lib_dir);
+    }
     let layers_dir = cache_dir.join("layers");
     let runtime_parent = cache_dir.join("runtime");
     std::fs::create_dir_all(&runtime_parent)
@@ -1254,7 +1295,29 @@ fn print_manifest_info(manifest: &smolvm_pack::PackManifest, checksum: u32) {
 // Daemon mode helpers and implementation
 // ===========================================================================
 
-/// Extract the checksum from any PackedMode variant.
+/// Compute a SHA-256-based cache key for any PackedMode variant.
+fn mode_cache_key(mode: &PackedMode) -> smolvm::Result<String> {
+    match mode {
+        #[cfg(target_os = "macos")]
+        PackedMode::Section {
+            assets_ptr,
+            assets_size,
+            ..
+        } => Ok(unsafe { extract::compute_section_cache_key(*assets_ptr, *assets_size) }),
+        PackedMode::Embedded {
+            exe_path, footer, ..
+        } => extract::compute_binary_cache_key(exe_path, footer)
+            .map_err(|e| Error::agent("compute cache key", e.to_string())),
+        PackedMode::Sidecar {
+            sidecar_path,
+            footer,
+            ..
+        } => extract::compute_sidecar_cache_key(sidecar_path, footer)
+            .map_err(|e| Error::agent("compute cache key", e.to_string())),
+    }
+}
+
+/// Extract the CRC32 checksum from any PackedMode variant (for display/integrity).
 fn mode_checksum(mode: &PackedMode) -> u32 {
     match mode {
         #[cfg(target_os = "macos")]
@@ -1264,11 +1327,11 @@ fn mode_checksum(mode: &PackedMode) -> u32 {
     }
 }
 
-/// Get the daemon state directory for a given checksum.
+/// Get the daemon state directory for a given cache key.
 ///
-/// Returns `~/.cache/smolvm-pack/{checksum:08x}/daemon/`.
-fn daemon_dir(checksum: u32) -> smolvm::Result<PathBuf> {
-    let cache_dir = extract::get_cache_dir(checksum)
+/// Returns `~/.cache/smolvm-pack/{cache_key}/daemon/`.
+fn daemon_dir(cache_key: &str) -> smolvm::Result<PathBuf> {
+    let cache_dir = extract::get_cache_dir(cache_key)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
     Ok(cache_dir.join("daemon"))
 }
@@ -1277,8 +1340,8 @@ fn daemon_dir(checksum: u32) -> smolvm::Result<PathBuf> {
 ///
 /// The PID file format is: `{pid}\n{start_time}`.
 /// Returns `None` if the file doesn't exist or is malformed.
-fn read_daemon_pid(checksum: u32) -> Option<(libc::pid_t, Option<u64>)> {
-    let dir = daemon_dir(checksum).ok()?;
+fn read_daemon_pid(cache_key: &str) -> Option<(libc::pid_t, Option<u64>)> {
+    let dir = daemon_dir(cache_key).ok()?;
     let pid_path = dir.join("agent.pid");
     let contents = std::fs::read_to_string(&pid_path).ok()?;
     let mut lines = contents.lines();
@@ -1289,11 +1352,11 @@ fn read_daemon_pid(checksum: u32) -> Option<(libc::pid_t, Option<u64>)> {
 
 /// Write PID and start time to the daemon PID file.
 fn write_daemon_pid(
-    checksum: u32,
+    cache_key: &str,
     pid: libc::pid_t,
     start_time: Option<u64>,
 ) -> smolvm::Result<()> {
-    let dir = daemon_dir(checksum)?;
+    let dir = daemon_dir(cache_key)?;
     let pid_path = dir.join("agent.pid");
     let contents = match start_time {
         Some(st) => format!("{}\n{}", pid, st),
@@ -1318,8 +1381,8 @@ fn read_manifest_for_mode(mode: &PackedMode) -> smolvm::Result<smolvm_pack::Pack
 
 /// Ensure assets are extracted to the cache directory for the given mode.
 fn ensure_extracted(mode: &PackedMode, force: bool, debug: bool) -> smolvm::Result<PathBuf> {
-    let checksum = mode_checksum(mode);
-    let cache_dir = extract::get_cache_dir(checksum)
+    let cache_key = mode_cache_key(mode)?;
+    let cache_dir = extract::get_cache_dir(&cache_key)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
     let needs_extract = force || !extract::is_extracted(&cache_dir);
@@ -1349,14 +1412,16 @@ fn ensure_extracted(mode: &PackedMode, force: bool, debug: bool) -> smolvm::Resu
                     .map_err(|e| Error::agent("extract sidecar assets", e.to_string()))?;
             }
         }
+        // Auto-evict old cache entries to prevent unbounded growth
+        extract::auto_evict(10);
     }
 
     Ok(cache_dir)
 }
 
 /// Check if the daemon is currently running and connectable.
-fn is_daemon_running(checksum: u32) -> bool {
-    let Some((pid, start_time)) = read_daemon_pid(checksum) else {
+fn is_daemon_running(cache_key: &str) -> bool {
+    let Some((pid, start_time)) = read_daemon_pid(cache_key) else {
         return false;
     };
 
@@ -1366,7 +1431,7 @@ fn is_daemon_running(checksum: u32) -> bool {
     }
 
     // Try to actually connect and ping
-    let dir = match daemon_dir(checksum) {
+    let dir = match daemon_dir(cache_key) {
         Ok(d) => d,
         Err(_) => return false,
     };
@@ -1391,7 +1456,7 @@ fn daemon_start(
     debug: bool,
     force_extract: bool,
 ) -> smolvm::Result<()> {
-    let checksum = mode_checksum(mode);
+    let cache_key = mode_cache_key(mode)?;
     let manifest = read_manifest_for_mode(mode)?;
 
     // Extract assets to cache
@@ -1403,8 +1468,8 @@ fn daemon_start(
         .map_err(|e| Error::agent("create daemon dir", e.to_string()))?;
 
     // Check if already running
-    if is_daemon_running(checksum) {
-        let (pid, _) = read_daemon_pid(checksum).unwrap();
+    if is_daemon_running(&cache_key) {
+        let (pid, _) = read_daemon_pid(&cache_key).unwrap();
         println!("Daemon already running (PID: {})", pid);
         return Ok(());
     }
@@ -1457,6 +1522,9 @@ fn daemon_start(
 
     let rootfs_path = cache_dir.join("agent-rootfs");
     let lib_dir = resolve_lib_dir(&cache_dir, debug)?;
+    if debug {
+        debug_libkrun_fingerprint(&lib_dir);
+    }
     let layers_dir = cache_dir.join("layers");
 
     if debug {
@@ -1536,7 +1604,7 @@ fn daemon_start(
     };
 
     // Write PID file
-    write_daemon_pid(checksum, child_pid, child_start_time)?;
+    write_daemon_pid(&cache_key, child_pid, child_start_time)?;
 
     if debug {
         eprintln!("debug: forked VM process with PID {}", child_pid);
@@ -1552,16 +1620,16 @@ fn daemon_start(
 
 /// Execute a command in the running daemon VM.
 fn daemon_exec(
-    checksum: u32,
+    cache_key: &str,
     args: PackedExecArgs,
     debug: bool,
     manifest: &smolvm_pack::PackManifest,
 ) -> smolvm::Result<()> {
-    let dir = daemon_dir(checksum)?;
+    let dir = daemon_dir(cache_key)?;
     let sock_path = dir.join("agent.sock");
 
     // Check daemon is running
-    if !is_daemon_running(checksum) {
+    if !is_daemon_running(cache_key) {
         return Err(Error::agent(
             "daemon exec",
             "daemon is not running. Start it with: <binary> start",
@@ -1593,13 +1661,13 @@ fn daemon_exec(
 }
 
 /// Stop the daemon VM.
-fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
-    let Some((pid, start_time)) = read_daemon_pid(checksum) else {
+fn daemon_stop(cache_key: &str, debug: bool) -> smolvm::Result<()> {
+    let Some((pid, start_time)) = read_daemon_pid(cache_key) else {
         println!("Daemon not running");
         return Ok(());
     };
 
-    let dir = daemon_dir(checksum)?;
+    let dir = daemon_dir(cache_key)?;
     let sock_path = dir.join("agent.sock");
 
     // Try graceful shutdown via agent protocol.
@@ -1647,8 +1715,8 @@ fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
 }
 
 /// Check daemon status.
-fn daemon_status(checksum: u32) -> smolvm::Result<()> {
-    let Some((pid, start_time)) = read_daemon_pid(checksum) else {
+fn daemon_status(cache_key: &str) -> smolvm::Result<()> {
+    let Some((pid, start_time)) = read_daemon_pid(cache_key) else {
         println!("Status: not running");
         return Ok(());
     };
@@ -1657,7 +1725,7 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
     if !smolvm::process::is_our_process_strict(pid, start_time) {
         println!("Status: not running (stale PID file)");
         // Clean up stale files
-        if let Ok(dir) = daemon_dir(checksum) {
+        if let Ok(dir) = daemon_dir(cache_key) {
             if let Err(e) = std::fs::remove_file(dir.join("agent.pid")) {
                 tracing::debug!(error = %e, "cleanup: remove stale status PID file");
             }
@@ -1669,7 +1737,7 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
     }
 
     // Try to connect and ping
-    let dir = daemon_dir(checksum)?;
+    let dir = daemon_dir(cache_key)?;
     let sock_path = dir.join("agent.sock");
 
     if sock_path.exists() {

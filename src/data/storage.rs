@@ -109,16 +109,26 @@ impl HostMount {
     /// If no mode is provided, the mount defaults to writable.
     /// The source path is validated, required to be a directory, and canonicalized.
     fn _parse(spec: &str) -> Result<Self> {
-        let parts: Vec<&str> = spec.split(':').collect();
+        // Strip trailing :ro or :rw access mode
+        let (spec, read_only) = if let Some(s) = spec.strip_suffix(":ro") {
+            (s, true)
+        } else if let Some(s) = spec.strip_suffix(":rw") {
+            (s, false)
+        } else {
+            (spec, false)
+        };
 
-        match parts.as_slice() {
-            [source, target] => Self::new(source, target, false),
-            [source, target, "ro"] => Self::new(source, target, true),
-            [source, target, "rw"] => Self::new(source, target, false),
-            _ => Err(Error::invalid_mount_path(format!(
-                "invalid format '{}' (expected host:guest[:ro|:rw])",
+        // Find the host:guest separator — the first `:` followed by `/`.
+        // This handles paths containing colons (e.g., /logs/2024:01:01:/data).
+        if let Some(pos) = spec.find(":/") {
+            let source = &spec[..pos];
+            let target = &spec[pos + 1..];
+            Self::new(source, target, read_only)
+        } else {
+            Err(Error::invalid_mount_path(format!(
+                "invalid format '{}' (expected host_path:/guest_path[:ro|:rw])",
                 spec
-            ))),
+            )))
         }
     }
 
@@ -252,9 +262,11 @@ mod tests {
 
     #[test]
     fn test_parse_mount_spec_invalid() {
+        // No :/ separator found
         assert!(HostMount::parse(&["/only/one/path".to_string()]).is_err());
         assert!(HostMount::parse(&["".to_string()]).is_err());
-        assert!(HostMount::parse(&["/a:/b:/c:/d".to_string()]).is_err());
+        // No guest path at all
+        assert!(HostMount::parse(&["noguest:noguest".to_string()]).is_err());
     }
 
     #[test]
@@ -275,15 +287,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_mount_spec_invalid_mode() {
-        let result = HostMount::parse(&["/host:/guest:invalid".to_string()]);
-        assert!(result.is_err());
+    fn test_parse_mount_spec_colon_in_path() {
+        // Paths with colons should work — the first :/ is the separator
+        let mount = parse_one("/tmp:/guest/2024:01:01");
+        assert_eq!(mount.source, PathBuf::from("/tmp").canonicalize().unwrap());
+        assert_eq!(mount.target, PathBuf::from("/guest/2024:01:01"));
+        assert!(!mount.read_only);
     }
 
     #[test]
-    fn test_parse_mount_spec_too_many_colons() {
-        let result = HostMount::parse(&["/a:/b:ro:extra".to_string()]);
-        assert!(result.is_err());
+    fn test_parse_mount_spec_colon_in_path_with_mode() {
+        let mount = parse_one("/tmp:/guest/2024:01:01:ro");
+        assert_eq!(mount.target, PathBuf::from("/guest/2024:01:01"));
+        assert!(mount.read_only);
     }
 
     #[test]

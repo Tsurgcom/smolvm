@@ -291,8 +291,19 @@ pub fn launch_agent_vm_dynamic(
         .as_ref()
         .is_some_and(|c| !c.is_empty());
     if config.resources.network || !config.port_mappings.is_empty() || has_egress_policy {
+        if config.debug {
+            eprintln!(
+                "debug: TSI setup: network={} ports={:?} egress_policy={}",
+                config.resources.network, config.port_mappings, has_egress_policy
+            );
+        }
+
         // SAFETY: ctx is valid, KRUN_TSI_HIJACK_INET is a valid flag
-        if unsafe { (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) } < 0 {
+        let vsock_ret = unsafe { (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) };
+        if config.debug {
+            eprintln!("debug: krun_add_vsock(TSI) returned {}", vsock_ret);
+        }
+        if vsock_ret < 0 {
             free_ctx_on_err!("krun_add_vsock with TSI failed");
         }
 
@@ -310,7 +321,11 @@ pub fn launch_agent_vm_dynamic(
         port_ptrs.push(std::ptr::null());
 
         // SAFETY: ctx is valid, port_ptrs is a null-terminated array of valid C strings
-        if unsafe { (krun.set_port_map)(ctx, port_ptrs.as_ptr()) } < 0 {
+        let port_ret = unsafe { (krun.set_port_map)(ctx, port_ptrs.as_ptr()) };
+        if config.debug {
+            eprintln!("debug: krun_set_port_map returned {} (ports: {:?})", port_ret, config.port_mappings);
+        }
+        if port_ret < 0 {
             free_ctx_on_err!("krun_set_port_map failed");
         }
 

@@ -5,7 +5,7 @@
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -121,14 +121,89 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// Marker file indicating extraction is complete.
 const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 
-/// Get the cache directory for a given checksum.
+/// Get the cache directory for a given content hash.
 ///
-/// Returns `~/.cache/smolvm-pack/<checksum>/` (hex-formatted).
-pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
+/// Returns `~/.cache/smolvm-pack/<hash>/`.
+///
+/// The hash should be a hex string (e.g., first 16 chars of SHA-256).
+pub fn get_cache_dir(hash_hex: &str) -> std::io::Result<PathBuf> {
     let base = dirs::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
 
-    Ok(base.join("smolvm-pack").join(format!("{:08x}", checksum)))
+    Ok(base.join("smolvm-pack").join(hash_hex))
+}
+
+/// Compute a SHA-256-based cache key for a sidecar file.
+///
+/// Hashes the `[0..assets_size + manifest_size]` region (the content that
+/// matters for extraction) and returns the first 16 hex characters.
+/// This gives 64 bits of identity — collision-free for practical purposes.
+pub fn compute_sidecar_cache_key(
+    sidecar_path: &Path,
+    footer: &PackFooter,
+) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = File::open(sidecar_path)?;
+    let mut hasher = Sha256::new();
+    let total = footer.assets_size + footer.manifest_size;
+    let mut remaining = total;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    let hash = hasher.finalize();
+    Ok(format!("{:x}", hash)[..16].to_string())
+}
+
+/// Compute a SHA-256-based cache key from a region of a binary file.
+///
+/// Used for embedded mode where assets are appended to the executable.
+pub fn compute_binary_cache_key(
+    exe_path: &Path,
+    footer: &PackFooter,
+) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = File::open(exe_path)?;
+    file.seek(SeekFrom::Start(footer.assets_offset))?;
+    let mut hasher = Sha256::new();
+    let total = footer.assets_size + footer.manifest_size;
+    let mut remaining = total;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    let hash = hasher.finalize();
+    Ok(format!("{:x}", hash)[..16].to_string())
+}
+
+/// Compute a SHA-256-based cache key from an in-memory region.
+///
+/// Used for Mach-O section mode where assets are mapped into memory.
+///
+/// # Safety
+///
+/// `data` must point to a valid, readable memory region of at least `size` bytes.
+#[cfg(target_os = "macos")]
+pub unsafe fn compute_section_cache_key(data: *const u8, size: usize) -> String {
+    use sha2::{Digest, Sha256};
+
+    let slice = unsafe { std::slice::from_raw_parts(data, size) };
+    let hash = Sha256::digest(slice);
+    format!("{:x}", hash)[..16].to_string()
 }
 
 /// Check if assets have already been extracted.
@@ -223,6 +298,17 @@ fn extract_sidecar_inner(
     footer: &PackFooter,
     debug: bool,
 ) -> std::io::Result<()> {
+    // Clean up partial extraction artifacts from a previous interrupted run.
+    // This is safe because we hold the exclusive flock.
+    if cache_dir.exists() && !is_extracted(cache_dir) {
+        if debug {
+            eprintln!(
+                "debug: removing partial extraction at {}",
+                cache_dir.display()
+            );
+        }
+        let _ = fs::remove_dir_all(cache_dir);
+    }
     fs::create_dir_all(cache_dir)?;
 
     if debug {
@@ -260,6 +346,10 @@ pub fn extract_from_binary(
     footer: &PackFooter,
     debug: bool,
 ) -> std::io::Result<()> {
+    // Clean up partial extraction from a previous interrupted run
+    if cache_dir.exists() && !is_extracted(cache_dir) {
+        let _ = fs::remove_dir_all(cache_dir);
+    }
     fs::create_dir_all(cache_dir)?;
 
     if is_sidecar_mode(footer) {
@@ -307,6 +397,10 @@ pub unsafe fn extract_from_section(
     assets_size: usize,
     debug: bool,
 ) -> std::io::Result<()> {
+    // Clean up partial extraction from a previous interrupted run
+    if cache_dir.exists() && !is_extracted(cache_dir) {
+        let _ = fs::remove_dir_all(cache_dir);
+    }
     fs::create_dir_all(cache_dir)?;
 
     if debug {
@@ -330,6 +424,74 @@ pub unsafe fn extract_from_section(
     }
 
     post_process_extraction(cache_dir, debug)?;
+    Ok(())
+}
+
+/// Copy a file while preserving sparseness.
+///
+/// Reads the source in 64KB chunks and skips all-zero chunks in the
+/// destination by seeking past them, creating holes. This avoids the
+/// 512MB actual disk usage caused by tar extraction losing sparseness
+/// on the storage.ext4 template.
+fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut reader = File::open(src)?;
+    let file_size = reader.metadata()?.len();
+    let writer = File::create(dst)?;
+    writer.set_len(file_size)?;
+    let mut writer = std::io::BufWriter::new(writer);
+
+    const CHUNK: usize = 65536;
+    let mut buf = [0u8; CHUNK];
+    let zero_buf = [0u8; CHUNK];
+    let mut offset: u64 = 0;
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if buf[..n] == zero_buf[..n] {
+            // Skip zero chunk — leave a hole in the destination
+            offset += n as u64;
+        } else {
+            writer.seek(SeekFrom::Start(offset))?;
+            writer.write_all(&buf[..n])?;
+            offset += n as u64;
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-sparsify a file in place by copying through a temporary file.
+///
+/// If the file is already sparse or doesn't exist, this is a no-op.
+fn resparsify(path: &Path, debug: bool) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let tmp = path.with_extension("sparse.tmp");
+    sparse_copy(path, &tmp)?;
+    fs::rename(&tmp, path)?;
+
+    if debug {
+        let meta = fs::metadata(path)?;
+        #[cfg(unix)]
+        let actual = {
+            use std::os::unix::fs::MetadataExt;
+            meta.blocks() * 512
+        };
+        #[cfg(not(unix))]
+        let actual = meta.len();
+        eprintln!(
+            "debug: re-sparsified {} (virtual={}, actual={})",
+            path.display(),
+            meta.len(),
+            actual,
+        );
+    }
+
     Ok(())
 }
 
@@ -372,6 +534,10 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
             }
         }
     }
+
+    // Re-sparsify the storage template — tar extraction loses sparseness,
+    // turning the 512MB virtual/~100KB actual sparse file into 512MB actual.
+    resparsify(&cache_dir.join("storage.ext4"), debug)?;
 
     // Write marker file
     fs::write(cache_dir.join(EXTRACTION_MARKER), "")?;
@@ -557,7 +723,8 @@ pub fn copy_overlay_template(
         ));
     }
 
-    fs::copy(&src, dest)?;
+    // Use sparse copy to preserve holes in the overlay template
+    sparse_copy(&src, dest)?;
 
     // Extend if requested size is larger than template
     if let Some(gb) = size_gb_override {
@@ -588,7 +755,10 @@ pub fn create_or_copy_storage_disk(
     if let Some(template) = template_path {
         let template_path = cache_dir.join(template);
         if template_path.exists() {
-            fs::copy(&template_path, storage_path)?;
+            // Use sparse copy to preserve holes in the storage template.
+            // The template is 512MB virtual but only ~100KB actual data;
+            // fs::copy would allocate the full 512MB on disk.
+            sparse_copy(&template_path, storage_path)?;
             // If a custom size was requested and it's larger than the template,
             // extend the sparse file (resize2fs in the agent will expand the FS).
             if let Some(gb) = size_gb_override {
@@ -610,14 +780,118 @@ pub fn create_or_copy_storage_disk(
     create_storage_disk(storage_path, size)
 }
 
+/// Maximum age for stale runtime temp directories (24 hours).
+const STALE_RUNTIME_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Automatically evict old cache entries and clean stale runtime directories.
+///
+/// Keeps the `max_entries` most recently modified cache directories.
+/// Also cleans up runtime temp directories older than 24 hours in all
+/// surviving cache entries (orphaned from crashed runs).
+///
+/// This function is best-effort — errors are silently ignored since
+/// eviction is non-critical.
+pub fn auto_evict(max_entries: usize) {
+    let Some(base) = dirs::cache_dir() else {
+        return;
+    };
+    let pack_cache = base.join("smolvm-pack");
+    if !pack_cache.exists() {
+        return;
+    }
+
+    // Collect cache entry directories (skip lock files and non-dirs)
+    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    let Ok(read_dir) = fs::read_dir(&pack_cache) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let mtime = path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((path, mtime));
+    }
+
+    // Sort newest first
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Remove entries beyond max_entries
+    for (path, _) in entries.iter().skip(max_entries) {
+        let _ = fs::remove_dir_all(path);
+        // Also remove the lock file
+        let lock = path.with_extension("lock");
+        let _ = fs::remove_file(&lock);
+    }
+
+    // Clean stale runtime temp dirs in all surviving entries
+    let now = std::time::SystemTime::now();
+    for (path, _) in entries.iter().take(max_entries) {
+        let runtime_dir = path.join("runtime");
+        if !runtime_dir.exists() {
+            continue;
+        }
+        let Ok(runtime_entries) = fs::read_dir(&runtime_dir) else {
+            continue;
+        };
+        for entry in runtime_entries.flatten() {
+            let tmp_path = entry.path();
+            if !tmp_path.is_dir() {
+                continue;
+            }
+            let age = tmp_path
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| now.duration_since(t).ok());
+            if let Some(age) = age {
+                if age > STALE_RUNTIME_AGE {
+                    let _ = fs::remove_dir_all(&tmp_path);
+                }
+            }
+        }
+    }
+
+    // Also evict old libs cache entries
+    let libs_cache = base.join("smolvm-libs");
+    if libs_cache.exists() {
+        let mut lib_entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        if let Ok(rd) = fs::read_dir(&libs_cache) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let mtime = path
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                lib_entries.push((path, mtime));
+            }
+        }
+        lib_entries.sort_by(|a, b| b.1.cmp(&a.1));
+        for (path, _) in lib_entries.iter().skip(max_entries) {
+            let _ = fs::remove_dir_all(path);
+            let lock = path.with_extension("lock");
+            let _ = fs::remove_file(&lock);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_cache_dir_format() {
-        let dir = get_cache_dir(0xDEADBEEF).unwrap();
-        assert!(dir.to_string_lossy().contains("deadbeef"));
+        let dir = get_cache_dir("a1b2c3d4e5f67890").unwrap();
+        assert!(dir.to_string_lossy().contains("a1b2c3d4e5f67890"));
     }
 
     #[test]
