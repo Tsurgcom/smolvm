@@ -235,7 +235,7 @@ Content-Type: application/json
 
 ```bash
 # Bare Alpine shell
-smolvm machine run
+smolvm machine run -it
 
 # Smolfile with entrypoint/cmd (no container overhead)
 smolvm machine run -s Smolfile
