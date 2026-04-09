@@ -1425,4 +1425,36 @@ run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm
 run_test "Prune: refuses on running VM" test_prune_refuses_on_running_vm || true
 run_test "Prune --dry-run: refuses on running VM" test_prune_dry_run_refuses_on_running_vm || true
 
+# =============================================================================
+# grpcio / TSI SOL_SOCKET round-trip test
+#
+# ilyaterin grpc test — verifies that gRPC's c-core (grpcio) can establish a
+# secure channel. grpcio calls setsockopt(SO_REUSEADDR) then immediately reads
+# it back via getsockopt to verify. Without the TSI SOL_SOCKET mirror fix
+# (libkrunfw PR #89), getsockopt returns 0 and c-core treats the socket as
+# broken, causing FutureTimeoutError on channel_ready_future.
+#
+# This test catches regressions in the libkrunfw TSI setsockopt/getsockopt
+# mirroring that the SO_REUSEADDR round-trip depends on.
+# =============================================================================
+
+test_grpcio_channel_ready() {
+    local output
+    output=$($SMOLVM machine run --net --mem 4096 --image python:3.12-alpine -- sh -c '
+        pip install grpcio > /dev/null 2>&1
+        python3 -c "
+import os
+os.environ[\"GRPC_DNS_RESOLVER\"] = \"native\"
+import grpc
+ch = grpc.secure_channel(\"google.com:443\", grpc.ssl_channel_credentials())
+grpc.channel_ready_future(ch).result(timeout=10)
+print(\"grpcio_channel_ready: PASS\")
+"
+    ' 2>&1)
+    echo "$output"
+    [[ "$output" == *"grpcio_channel_ready: PASS"* ]]
+}
+
+run_test "grpcio: secure channel ready (ilyaterin grpc test)" test_grpcio_channel_ready || true
+
 print_summary "Machine Tests"
