@@ -73,10 +73,22 @@ pub fn pull_with_progress(
     let _ = std::io::stdout().flush();
 
     let mut last_percent = 0u8;
+    let mut syncing = false;
     let result = client.pull_with_registry_config_and_progress(
         image,
         oci_platform,
-        |percent, _total, _layer| {
+        |percent, _total, layer| {
+            if layer == "syncing" {
+                if !syncing {
+                    print!(
+                        "\rPulling image {}... [====================] 100% — syncing...",
+                        image
+                    );
+                    let _ = std::io::stdout().flush();
+                    syncing = true;
+                }
+                return;
+            }
             let percent = percent as u8;
             if percent != last_percent && percent <= 100 {
                 print!("\rPulling image {}... [", image);

@@ -777,6 +777,81 @@ impl ChildProcess {
     }
 }
 
+// ============================================================================
+// SIGINT guard — kill a VM child process on Ctrl+C
+// ============================================================================
+
+/// PID for the SIGINT handler to kill on Ctrl+C.
+/// Set by [`SigintGuard::new`], cleared on drop/disarm.
+static SIGINT_CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// RAII guard that ensures a VM child process is killed on Ctrl+C.
+///
+/// Without this, SIGINT terminates the parent immediately (default handler)
+/// without running Rust destructors, so [`AgentManager::drop`] never fires
+/// and the `setsid()`-detached VM child is orphaned.
+///
+/// The signal handler only calls `kill()` and `_exit()` (async-signal-safe).
+pub struct SigintGuard(());
+
+impl SigintGuard {
+    /// Install a SIGINT handler that will SIGTERM+SIGKILL the given PID.
+    pub fn new(pid: libc::pid_t) -> Self {
+        SIGINT_CHILD_PID.store(pid, Ordering::SeqCst);
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                sigint_kill_handler as *const () as libc::sighandler_t,
+            );
+        }
+        Self(())
+    }
+
+    /// Disarm the guard: clear the PID, restore default handler, skip Drop.
+    ///
+    /// Use when transitioning to a phase with its own SIGINT handling
+    /// (e.g., interactive exec).
+    pub fn disarm(self) {
+        SIGINT_CHILD_PID.store(0, Ordering::SeqCst);
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for SigintGuard {
+    fn drop(&mut self) {
+        SIGINT_CHILD_PID.store(0, Ordering::SeqCst);
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+    }
+}
+
+/// SIGINT handler: SIGTERM the child, brief busy-wait, escalate to SIGKILL, then _exit.
+///
+/// SAFETY: Only calls `kill()` and `_exit()`, both async-signal-safe.
+extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
+    let pid = SIGINT_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+            for _ in 0..10 {
+                if libc::kill(pid, 0) != 0 {
+                    break;
+                }
+            }
+            if libc::kill(pid, 0) == 0 {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    unsafe {
+        libc::_exit(128 + libc::SIGINT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

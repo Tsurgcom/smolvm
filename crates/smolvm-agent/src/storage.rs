@@ -856,11 +856,10 @@ where
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
 
-        // Report progress
-        progress(i + 1, total_layers, layer_id);
-
         if is_layer_cached(&layer_dir) {
             info!(layer = %layer_id, "layer already cached");
+            // Report progress after confirming cache hit
+            progress(i + 1, total_layers, layer_id);
             continue;
         }
 
@@ -953,7 +952,14 @@ where
         if let Ok(size) = dir_size(&layer_dir) {
             total_size += size;
         }
+
+        // Report progress after successful extraction
+        progress(i + 1, total_layers, layer_id);
     }
+
+    // Signal that layers are done and we're syncing — this can take a while
+    // for large images (gigabytes flushed through virtio-blk).
+    progress(total_layers, total_layers, "syncing");
 
     // Sync filesystem to ensure all layer data is persisted to the ext4 journal.
     // Defense in depth: even though shutdown waits for acknowledgment (which also

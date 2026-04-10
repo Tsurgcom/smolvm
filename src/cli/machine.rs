@@ -369,6 +369,11 @@ impl RunCmd {
 
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
+        // Install SIGINT guard so Ctrl+C during pull kills the VM process
+        // instead of orphaning it. The guard is disarmed before interactive
+        // exec (which has its own SIGINT handling).
+        let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
+
         // Resolve image: CLI > Smolfile > None (bare VM)
         let image = self.image.clone().or(params.image.clone());
 
@@ -477,6 +482,9 @@ impl RunCmd {
                     }
                 }
 
+                // Disarm SIGINT guard — detaching, VM stays running.
+                drop(sigint_guard);
+
                 println!("Machine running in background");
                 println!("\nTo interact:");
                 println!("  smolvm machine exec -- <command>");
@@ -486,6 +494,11 @@ impl RunCmd {
                 manager.detach();
                 Ok(())
             } else {
+                // Disarm SIGINT guard — exec phase has its own signal handling.
+                if let Some(guard) = sigint_guard {
+                    guard.disarm();
+                }
+
                 let exit_code = if interactive || tty {
                     let config = RunConfig::new(img, command)
                         .with_env(env)
@@ -517,7 +530,11 @@ impl RunCmd {
                 std::process::exit(exit_code);
             }
         } else {
-            // Bare VM mode (no image) — run entrypoint+cmd directly via vm_exec
+            // Bare VM mode (no image) — disarm SIGINT guard before exec.
+            if let Some(guard) = sigint_guard {
+                guard.disarm();
+            }
+
             if self.detach {
                 // Run entrypoint+cmd in background if present
                 let is_idle = command.is_empty()

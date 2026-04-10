@@ -350,6 +350,10 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // Get PID immediately (cheap) and print output before DB write
     let pid = manager.child_pid();
 
+    // Install SIGINT guard so Ctrl+C during init/pull kills the VM process
+    // instead of orphaning it. Disarmed before detach.
+    let _sigint_guard = pid.map(smolvm::process::SigintGuard::new);
+
     // Run init commands if configured (before reporting success)
     if !record.init.is_empty() {
         println!("Running {} init command(s)...", record.init.len());

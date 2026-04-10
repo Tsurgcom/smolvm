@@ -1457,4 +1457,63 @@ print(\"grpcio_channel_ready: PASS\")
 
 run_test "grpcio: secure channel ready (ilyaterin grpc test)" test_grpcio_channel_ready || true
 
+# =============================================================================
+# Storage Disk Resize & Large Image Pull
+#
+# Regression test for the storage disk template resize bug: the host copies
+# a 512MB ext4 template and extends the sparse file to 20GB, but the agent
+# must e2fsck + resize2fs the filesystem before mounting. Without this,
+# /dev/vda stays at 512MB and large image pulls fail with ENOSPC or the
+# container overlay mount fails with "wrong fs type" (overlayfs-on-overlayfs).
+# =============================================================================
+
+test_storage_resize_and_large_pull() {
+    # Force a fresh storage disk by deleting the default VM data directory.
+    # This ensures we exercise the template → resize → mount path.
+    $SMOLVM machine stop 2>/dev/null || true
+    local data_dir
+    data_dir=$(vm_data_dir "default")
+    rm -rf "$data_dir" 2>/dev/null || true
+
+    # Pull python:3.12 (full image: ~150MB compressed, ~1GB extracted).
+    # This exceeds the 512MB template size, so it will fail with ENOSPC
+    # if the storage disk was not properly resized from 512MB to 20GB.
+    local output exit_code=0
+    output=$($SMOLVM machine run --net --image python:3.12 -- python3 -c 'import sys; print(f"python {sys.version_info.major}.{sys.version_info.minor}")' 2>&1) || exit_code=$?
+
+    echo "$output"
+
+    # Verify the command succeeded and Python ran
+    [[ $exit_code -eq 0 ]] || { echo "Exit code: $exit_code"; return 1; }
+    [[ "$output" == *"python 3.12"* ]] || { echo "Expected python 3.12 output"; return 1; }
+}
+
+test_storage_mounted_as_ext4() {
+    # Verify /dev/vda is actually mounted at /storage as ext4 (not on overlay).
+    # This catches the bug where mount_storage_disk() silently fails and
+    # /storage is just a directory on the overlay rootfs.
+    local output
+    output=$($SMOLVM machine run --net -- sh -c '
+        mount_line=$(mount | grep "/dev/vda")
+        if [ -z "$mount_line" ]; then
+            echo "FAIL: /dev/vda not mounted"
+            exit 1
+        fi
+        echo "$mount_line"
+        # Verify the filesystem is large (>1GB = properly resized from 512MB template)
+        avail_kb=$(df /storage | tail -1 | awk "{print \$4}")
+        if [ "$avail_kb" -lt 1048576 ]; then
+            echo "FAIL: /storage too small (${avail_kb}KB available, expected >1GB)"
+            exit 1
+        fi
+        echo "PASS: storage mounted and resized"
+    ' 2>&1)
+
+    echo "$output"
+    [[ "$output" == *"PASS: storage mounted and resized"* ]]
+}
+
+run_test "Storage: resize + large image pull (fresh disk)" test_storage_resize_and_large_pull || true
+run_test "Storage: /dev/vda mounted as ext4 with correct size" test_storage_mounted_as_ext4 || true
+
 print_summary "Machine Tests"
