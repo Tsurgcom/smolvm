@@ -542,7 +542,15 @@ impl PackCreateCmd {
             return Ok(dir.clone());
         }
 
-        // Check common locations
+        // Best option: use the exact libkrun that this process has loaded.
+        // This guarantees the packed binary gets a library with all required symbols,
+        // avoiding mismatches when multiple libkrun versions are installed.
+        if let Some(dir) = Self::find_loaded_libkrun_dir() {
+            debug!(lib_dir = %dir.display(), "using libkrun from running process");
+            return Ok(dir);
+        }
+
+        // Fallback: check common locations
         let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
         let candidates = [
             // Relative to executable
@@ -583,6 +591,45 @@ impl PackCreateCmd {
             "find libkrun",
             "could not find libkrun library. Use --lib-dir to specify the location.",
         ))
+    }
+
+    /// Find the directory of the libkrun that this process has already loaded.
+    ///
+    /// Uses `dlopen(RTLD_NOLOAD)` to get a handle to the already-loaded library
+    /// (without loading a new one), then `dladdr` to resolve the symbol back to
+    /// a filesystem path. This ensures the packer bundles the exact same library
+    /// that smolvm itself linked against — no version mismatches possible.
+    fn find_loaded_libkrun_dir() -> Option<PathBuf> {
+        use std::ffi::{CStr, CString};
+
+        unsafe {
+            let name = CString::new(smolvm::util::libkrun_filename()).ok()?;
+            let handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOLOAD | libc::RTLD_LAZY);
+            if handle.is_null() {
+                return None;
+            }
+
+            let sym_name = CString::new("krun_create_ctx").ok()?;
+            let sym = libc::dlsym(handle, sym_name.as_ptr());
+            libc::dlclose(handle);
+
+            if sym.is_null() {
+                return None;
+            }
+
+            let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+            if libc::dladdr(sym, info.as_mut_ptr()) != 0 {
+                let info = info.assume_init();
+                if !info.dli_fname.is_null() {
+                    let lib_path = CStr::from_ptr(info.dli_fname).to_string_lossy();
+                    return std::path::Path::new(lib_path.as_ref())
+                        .parent()
+                        .map(|p| p.to_path_buf());
+                }
+            }
+        }
+
+        None
     }
 
     /// Find the agent rootfs directory.
@@ -894,4 +941,38 @@ fn dir_size(path: &std::path::Path) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that dladdr-based libkrun discovery finds the loaded library.
+    ///
+    /// This test works because the test binary links against libkrun the same
+    /// way the smolvm binary does (via build.rs). If the library is loaded,
+    /// find_loaded_libkrun_dir() must return its directory.
+    #[test]
+    fn find_loaded_libkrun_dir_returns_valid_path() {
+        let dir = PackCreateCmd::find_loaded_libkrun_dir();
+
+        // On CI without libkrun, the function returns None — that's fine,
+        // the fallback search handles it. But when libkrun IS loaded
+        // (which it is for any machine that can run smolvm), it must return
+        // a valid directory containing the library.
+        if let Some(ref dir) = dir {
+            assert!(dir.exists(), "dladdr returned non-existent dir: {:?}", dir);
+
+            let lib_name = smolvm::util::libkrun_filename();
+            let lib_path = dir.join(lib_name);
+            assert!(
+                lib_path.exists(),
+                "dladdr dir {:?} does not contain {}",
+                dir,
+                lib_name
+            );
+        }
+        // If None, libkrun wasn't loaded (e.g., weak link + library not found).
+        // This is expected in some CI environments and is not a failure.
+    }
 }

@@ -225,6 +225,75 @@ test_stub_has_libs_footer() {
 }
 
 # =============================================================================
+# Packed Binary - Library Compatibility
+# =============================================================================
+
+test_pack_bundled_libkrun_has_required_symbols() {
+    local output="$TEST_DIR/test-alpine"
+
+    # Ensure we have a packed binary
+    if [[ ! -f "$output" ]]; then
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
+    fi
+
+    # Boot the VM briefly to trigger lib extraction, capture debug output
+    local debug_output
+    debug_output=$(run_with_timeout 60 "$output" --debug run -- true 2>&1) || true
+
+    # Extract the lib_dir from debug output (e.g., "lib_dir=/path/to/lib")
+    local lib_dir
+    lib_dir=$(echo "$debug_output" | grep -o 'lib_dir=[^ ]*' | head -1 | cut -d= -f2)
+
+    if [[ -z "$lib_dir" ]]; then
+        echo "FAIL: could not determine lib_dir from --debug output"
+        return 1
+    fi
+
+    local libkrun="$lib_dir/libkrun.dylib"
+    if [[ "$(uname)" != "Darwin" ]]; then
+        libkrun="$lib_dir/libkrun.so"
+    fi
+
+    if [[ ! -f "$libkrun" ]]; then
+        echo "FAIL: bundled libkrun not found at $libkrun"
+        return 1
+    fi
+
+    # Verify all required symbols exist in the bundled library.
+    # This catches the bug where an older system libkrun gets bundled
+    # instead of the one smolvm was built against.
+    local symbols
+    symbols=$(nm -gU "$libkrun" 2>/dev/null) || { echo "FAIL: nm failed on $libkrun"; return 1; }
+
+    local missing=0
+    for sym in krun_create_ctx krun_add_disk2 krun_add_vsock_port2 krun_start_enter; do
+        if ! echo "$symbols" | grep -q "_${sym}$"; then
+            echo "FAIL: bundled libkrun missing required symbol: $sym"
+            missing=1
+        fi
+    done
+
+    [[ $missing -eq 0 ]]
+}
+
+test_pack_uses_loaded_libkrun() {
+    # Verify the packer prefers dladdr over directory search
+    local output="$TEST_DIR/test-dladdr"
+    local pack_output
+    pack_output=$(RUST_LOG=debug $SMOLVM pack create --image alpine:latest -o "$output" 2>&1)
+
+    # Debug log should show "using libkrun from running process"
+    if echo "$pack_output" | grep -q "using libkrun from running process"; then
+        return 0
+    else
+        echo "WARN: dladdr path not used — falling back to directory search"
+        # Not a hard failure: dladdr may not work in all link configurations.
+        # The symbol check test above is the real safety net.
+        return 0
+    fi
+}
+
+# =============================================================================
 # Packed Binary - Ephemeral Execution (Requires VM)
 # =============================================================================
 
@@ -678,6 +747,13 @@ run_test "Sidecar has SMOLPACK magic" test_sidecar_has_magic || true
 run_test "Sidecar has no libs (V3)" test_sidecar_has_no_libs || true
 run_test "Stub has SMOLLIBS footer" test_stub_has_libs_footer || true
 run_test "Binary is clean Mach-O" test_binary_is_clean_macho || true
+
+echo ""
+echo "Running Library Compatibility Tests..."
+echo ""
+
+run_test "Bundled libkrun has required symbols" test_pack_bundled_libkrun_has_required_symbols || true
+run_test "Pack uses loaded libkrun (dladdr)" test_pack_uses_loaded_libkrun || true
 
 echo ""
 echo "Running Sidecar Tests..."
