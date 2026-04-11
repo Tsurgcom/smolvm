@@ -414,8 +414,11 @@ fn setup_persistent_rootfs() {
     // Resize ext4 on the UNMOUNTED device before mounting. The host copies
     // from a small template (~512MB) then extends the sparse file. resize2fs
     // on a mounted device fails with "Resource busy" — must resize first.
+    // Skip if filesystem already fills the device (subsequent boots).
     // If resize fails (macOS-created template), the mount+mkfs fallback below handles it.
-    let _ = resize_ext4_if_needed(OVERLAY_DEVICE, "overlay");
+    if !ext4_already_full_size(OVERLAY_DEVICE) {
+        let _ = resize_ext4_if_needed(OVERLAY_DEVICE, "overlay");
+    }
 
     // Try to mount overlay disk (should be pre-formatted ext4)
     let dev = cstr(OVERLAY_DEVICE);
@@ -472,9 +475,10 @@ fn setup_persistent_rootfs() {
         let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
         Some(std::thread::spawn(|| {
             // Resize before mount — template may be smaller than device.
+            // Skip if filesystem already fills the device (subsequent boots).
             // If resize fails (e.g. macOS-created template with incompatible features),
             // skip mount — mount_storage_disk() will handle mkfs fallback.
-            if !resize_ext4_if_needed(STORAGE_DEVICE, "storage") {
+            if !ext4_already_full_size(STORAGE_DEVICE) && !resize_ext4_if_needed(STORAGE_DEVICE, "storage") {
                 boot_log(
                     "WARN",
                     "storage: resize failed, deferring to mount_storage_disk",
@@ -715,65 +719,139 @@ fn setup_signal_handlers() {
 /// MUST be called BEFORE mounting — resize2fs on a mounted device fails with
 /// "Resource busy" because the kernel holds the block device exclusively.
 ///
-/// Runs `e2fsck -f` first because resize2fs requires a clean filesystem.
+/// Tries resize2fs directly first. Only falls back to e2fsck if resize2fs
+/// fails (e.g., due to actual corruption). ext4 journal replay handles
+/// `needs_recovery` on mount in ~1-2ms, so a full e2fsck is unnecessary
+/// on the happy path. Uses boot_log instead of tracing because this runs
+/// before tracing_subscriber is initialized.
 fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
     use std::process::Command;
 
-    // e2fsck -f is required before resize2fs — without it, resize2fs
-    // refuses to run ("Please run e2fsck first"). The -y flag auto-fixes
-    // any errors, -f forces check even if filesystem appears clean.
-    match Command::new("e2fsck").args(["-f", "-y", device]).output() {
+    // Try resize2fs directly — skip e2fsck on the happy path.
+    // ext4 journal replay handles needs_recovery on mount, so resize2fs
+    // usually succeeds without a prior fsck.
+    match Command::new("resize2fs").arg(device).output() {
+        Ok(output) if output.status.success() => {
+            let msg = String::from_utf8_lossy(&output.stderr);
+            if msg.contains("Nothing to do") {
+                boot_log("DEBUG", &format!("{} filesystem already at full device size", label));
+            } else {
+                boot_log("INFO", &format!("{} filesystem resized to fill block device", label));
+            }
+            return true;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            boot_log("WARN", &format!(
+                "{} resize2fs failed (exit {}): {}, trying e2fsck",
+                label, output.status.code().unwrap_or(-1), stderr.trim()
+            ));
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("{} resize2fs not found: {}", label, e));
+            return false;
+        }
+    }
+
+    // Fallback: resize2fs failed, run e2fsck -y (without -f) then retry.
+    // Without -f, e2fsck skips clean filesystems instantly. With needs_recovery,
+    // it replays the journal (~10ms) instead of a full forced scan (~128ms).
+    match Command::new("e2fsck").args(["-y", device]).output() {
         Ok(output) => {
             let code = output.status.code().unwrap_or(-1);
             // e2fsck exit codes:
             //   0 = clean, 1 = errors fixed, 2 = errors fixed + reboot needed
             //   4 = errors left uncorrected, 8 = operational error
-            // Codes >= 4 mean the filesystem is not trustworthy — skip resize.
             if code >= 4 {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(
-                    "{} e2fsck could not repair filesystem (exit {}): {}",
-                    label,
-                    code,
-                    stderr.trim()
-                );
+                boot_log("WARN", &format!(
+                    "{} e2fsck could not repair (exit {}): {}", label, code, stderr.trim()
+                ));
                 return false;
             }
             if code > 0 {
-                tracing::info!("{} e2fsck fixed errors (exit {})", label, code);
+                boot_log("INFO", &format!("{} e2fsck fixed errors (exit {})", label, code));
             }
         }
         Err(e) => {
-            tracing::warn!("{} e2fsck not found: {}", label, e);
+            boot_log("WARN", &format!("{} e2fsck not found: {}", label, e));
             return false;
         }
     }
 
+    // Retry resize2fs after e2fsck
     match Command::new("resize2fs").arg(device).output() {
         Ok(output) if output.status.success() => {
-            let msg = String::from_utf8_lossy(&output.stderr);
-            if msg.contains("Nothing to do") {
-                tracing::debug!("{} filesystem already at full device size", label);
-            } else {
-                tracing::info!("{} filesystem resized to fill block device", label);
-            }
+            boot_log("INFO", &format!("{} filesystem resized after e2fsck", label));
             true
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!(
-                "{} resize2fs failed (exit {}): {}",
-                label,
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            );
+            boot_log("WARN", &format!(
+                "{} resize2fs still failed after e2fsck (exit {}): {}",
+                label, output.status.code().unwrap_or(-1), stderr.trim()
+            ));
             false
         }
         Err(e) => {
-            tracing::warn!("{} resize2fs not found or failed to execute: {}", label, e);
+            boot_log("WARN", &format!("{} resize2fs failed: {}", label, e));
             false
         }
     }
+}
+
+/// Check if ext4 filesystem already fills the block device.
+///
+/// Reads the ext4 superblock (at offset 1024) to get block_count and block_size,
+/// then compares against the device size. Returns true if the filesystem already
+/// spans the full device, meaning resize2fs would be a no-op. This avoids the
+/// ~5ms cost of spawning resize2fs on every subsequent boot.
+///
+/// Returns false (conservative, triggers resize path) on any error: unformatted
+/// device, non-ext4 filesystem, corrupt superblock, or I/O failure.
+fn ext4_already_full_size(device: &str) -> bool {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match File::open(device) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    // For block devices, metadata().len() returns 0. Use seek to find size.
+    let dev_size = match f.seek(SeekFrom::End(0)) {
+        Ok(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // ext4 superblock starts at byte offset 1024. We need:
+    //   offset  4: s_blocks_count_lo (4 bytes)
+    //   offset 24: s_log_block_size  (4 bytes)
+    //   offset 56: s_magic           (2 bytes) — must be 0xEF53
+    let mut sb = [0u8; 64];
+    if f.seek(SeekFrom::Start(1024)).is_err() || f.read_exact(&mut sb).is_err() {
+        return false;
+    }
+
+    // Validate ext4 magic number before trusting any fields.
+    let magic = u16::from_le_bytes([sb[56], sb[57]]);
+    if magic != 0xEF53 {
+        return false;
+    }
+
+    let log_block_size = u32::from_le_bytes([sb[24], sb[25], sb[26], sb[27]]);
+    // Sanity check: log_block_size > 6 means block_size > 64 MB, not valid ext4.
+    if log_block_size > 6 {
+        return false;
+    }
+    let block_size: u64 = 1024u64 << log_block_size;
+
+    let blocks_lo = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]) as u64;
+    let fs_size = blocks_lo * block_size;
+
+    // Allow 1 block of slack — filesystem may not use the very last block.
+    // Note: only uses s_blocks_count_lo (sufficient for disks up to 16 TB at 4K blocks).
+    fs_size + block_size >= dev_size
 }
 
 /// Check /proc/mounts to see if anything is mounted at the given path.
@@ -855,8 +933,8 @@ fn mount_storage_disk() -> bool {
         return true;
     }
 
-    // --- Attempt 1: resize + mount (works on subsequent boots) ---
-    let resized = resize_ext4_if_needed(STORAGE_DEVICE, "storage");
+    // --- Attempt 1: resize (if needed) + mount (works on subsequent boots) ---
+    let resized = ext4_already_full_size(STORAGE_DEVICE) || resize_ext4_if_needed(STORAGE_DEVICE, "storage");
     if resized && try_mount_storage_ext4() {
         info!("storage disk mounted after resize");
         create_storage_dirs(STORAGE_MOUNT);
