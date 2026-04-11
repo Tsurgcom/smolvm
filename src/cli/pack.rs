@@ -15,7 +15,7 @@ use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 /// via virtio balloon, so the host only commits what the guest actually uses.
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 8192;
 use smolvm::config::{RecordState, SmolvmConfig};
-use smolvm::platform::{Arch, Os, VmExecutor};
+use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{PackManifest, PackMode};
@@ -34,6 +34,15 @@ pub enum PackCmd {
     /// Run a VM from a packed .smolmachine sidecar file
     Run(super::pack_run::PackRunCmd),
 
+    /// Push a .smolmachine artifact to a registry
+    Push(PackPushCmd),
+
+    /// Pull a .smolmachine artifact from a registry
+    Pull(PackPullCmd),
+
+    /// Inspect a .smolmachine artifact in a registry (without downloading)
+    Inspect(PackInspectCmd),
+
     /// Clean up cached pack extractions to free disk space
     Prune(PackPruneCmd),
 }
@@ -43,6 +52,9 @@ impl PackCmd {
         match self {
             PackCmd::Create(cmd) => cmd.run(),
             PackCmd::Run(cmd) => cmd.run(),
+            PackCmd::Push(cmd) => cmd.run(),
+            PackCmd::Pull(cmd) => cmd.run(),
+            PackCmd::Inspect(cmd) => cmd.run(),
             PackCmd::Prune(cmd) => cmd.run(),
         }
     }
@@ -289,7 +301,9 @@ impl PackCreateCmd {
 
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);
-        let mut manifest = PackManifest::new(image, image_info.digest.clone(), platform);
+        let host_platform = Platform::current().host_oci_platform().to_string();
+        let mut manifest =
+            PackManifest::new(image, image_info.digest.clone(), platform, host_platform);
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
 
@@ -392,8 +406,13 @@ impl PackCreateCmd {
 
         // 6. Build manifest
         let platform = format!("linux/{}", Arch::current().oci_arch());
-        let mut manifest =
-            PackManifest::new(format!("vm://{}", vm_name), "none".to_string(), platform);
+        let host_platform = Platform::current().host_oci_platform().to_string();
+        let mut manifest = PackManifest::new(
+            format!("vm://{}", vm_name),
+            "none".to_string(),
+            platform,
+            host_platform,
+        );
         manifest.mode = PackMode::Vm;
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
@@ -921,6 +940,271 @@ impl PackPruneCmd {
 
         Ok((freed, removed))
     }
+}
+
+// ============================================================================
+// Push / Pull — registry operations for .smolmachine artifacts
+// ============================================================================
+
+/// Push a .smolmachine artifact to a registry.
+///
+/// Examples:
+///   smolvm pack push myapp:v1 -f ./my-app.smolmachine
+///   smolvm pack push registry.example.com/myapp:latest -f ./app.smolmachine
+#[derive(Args, Debug)]
+pub struct PackPushCmd {
+    /// Artifact reference (e.g., myapp:v1, registry.example.com/myapp:latest)
+    #[arg(value_name = "REFERENCE")]
+    pub reference: String,
+
+    /// Path to the .smolmachine file to push
+    #[arg(short = 'f', long, value_name = "PATH")]
+    pub file: PathBuf,
+}
+
+impl PackPushCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        if !self.file.exists() {
+            return Err(Error::agent(
+                "push",
+                format!("file not found: {}", self.file.display()),
+            ));
+        }
+
+        let parsed = smolvm::registry::Reference::parse(&self.reference)
+            .map_err(|e| Error::agent("parse reference", e.to_string()))?;
+        let config = smolvm::registry::RegistryConfig::load()?;
+        let client = build_registry_client(&parsed.registry, &config)?;
+
+        let repo = parsed.repository();
+        let tag = parsed.tag.as_deref().unwrap_or("latest");
+
+        eprintln!(
+            "Pushing {} to {}/{}:{}",
+            self.file.display(),
+            parsed.registry,
+            repo,
+            tag
+        );
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
+
+        let result = rt
+            .block_on(smolvm_registry::push(&client, &repo, tag, &self.file))
+            .map_err(|e| Error::agent("registry push", e.to_string()))?;
+
+        eprintln!(
+            "Pushed successfully\n  Layer:    {} ({} bytes)\n  Manifest: {}",
+            result.layer_digest, result.layer_size, result.manifest_digest,
+        );
+        Ok(())
+    }
+}
+
+/// Pull a .smolmachine artifact from a registry.
+///
+/// Examples:
+///   smolvm pack pull myapp:v1
+///   smolvm pack pull myapp:v1 -o ./my-app.smolmachine
+///   smolvm pack pull registry.example.com/myapp@sha256:abc123...
+#[derive(Args, Debug)]
+pub struct PackPullCmd {
+    /// Artifact reference (e.g., myapp:v1, registry.example.com/myapp:latest)
+    #[arg(value_name = "REFERENCE")]
+    pub reference: String,
+
+    /// Output path for the downloaded .smolmachine file
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+impl PackPullCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let parsed = smolvm::registry::Reference::parse(&self.reference)
+            .map_err(|e| Error::agent("parse reference", e.to_string()))?;
+        let config = smolvm::registry::RegistryConfig::load()?;
+        let client = build_registry_client(&parsed.registry, &config)?;
+
+        let repo = parsed.repository();
+        let tag_or_digest = parsed
+            .digest
+            .as_deref()
+            .or(parsed.tag.as_deref())
+            .unwrap_or("latest");
+
+        eprintln!("Pulling {}/{}:{}", parsed.registry, repo, tag_or_digest);
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
+
+        let cache = smolvm_registry::BlobCache::open_default()
+            .map_err(|e| Error::agent("open blob cache", e.to_string()))?;
+
+        let result = rt
+            .block_on(smolvm_registry::pull(
+                &client,
+                &repo,
+                tag_or_digest,
+                self.output.as_deref(),
+                &cache,
+            ))
+            .map_err(|e| Error::agent("registry pull", e.to_string()))?;
+
+        if result.cached {
+            eprintln!("Using cached blob ({})", result.digest);
+        }
+
+        let dest = self.output.unwrap_or(result.path);
+        eprintln!(
+            "Pulled successfully -> {} ({} bytes)",
+            dest.display(),
+            result.size,
+        );
+        Ok(())
+    }
+}
+
+/// Inspect a .smolmachine artifact in a registry without downloading the full artifact.
+///
+/// Fetches only the OCI manifest and config blob (~1KB total) to display
+/// metadata about the packed machine.
+///
+/// Examples:
+///   smolvm pack inspect myapp:v1
+///   smolvm pack inspect myapp:v1 --json
+#[derive(Args, Debug)]
+pub struct PackInspectCmd {
+    /// Artifact reference (e.g., myapp:v1, registry.example.com/myapp:latest)
+    #[arg(value_name = "REFERENCE")]
+    pub reference: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl PackInspectCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let parsed = smolvm::registry::Reference::parse(&self.reference)
+            .map_err(|e| Error::agent("parse reference", e.to_string()))?;
+        let config = smolvm::registry::RegistryConfig::load()?;
+        let client = build_registry_client(&parsed.registry, &config)?;
+
+        let repo = parsed.repository();
+        let tag_or_digest = parsed
+            .digest
+            .as_deref()
+            .or(parsed.tag.as_deref())
+            .unwrap_or("latest");
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
+
+        rt.block_on(run_inspect(
+            &client,
+            &parsed,
+            &repo,
+            tag_or_digest,
+            self.json,
+        ))
+    }
+}
+
+async fn run_inspect(
+    client: &smolvm_registry::RegistryClient,
+    parsed: &smolvm::registry::Reference,
+    repo: &str,
+    tag_or_digest: &str,
+    json_output: bool,
+) -> smolvm::Result<()> {
+    // Fetch OCI manifest (~200 bytes).
+    let manifest_bytes = client
+        .get_manifest(repo, tag_or_digest)
+        .await
+        .map_err(|e| Error::agent("fetch manifest", e.to_string()))?;
+
+    let oci_manifest: smolvm_registry::OciManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("parse manifest", e.to_string()))?;
+
+    // Extract layer size from OCI manifest.
+    let layer_size = oci_manifest.layers.first().map(|l| l.size).unwrap_or(0);
+    let layer_digest = oci_manifest
+        .layers
+        .first()
+        .map(|l| l.digest.as_str())
+        .unwrap_or("unknown");
+
+    // Fetch config blob (~500 bytes) — contains the PackManifest.
+    let config_bytes = client
+        .pull_blob(repo, &oci_manifest.config.digest)
+        .await
+        .map_err(|e| Error::agent("fetch config", e.to_string()))?;
+
+    let pack_manifest: smolvm_pack::PackManifest = serde_json::from_slice(&config_bytes)
+        .map_err(|e| Error::agent("parse config", e.to_string()))?;
+
+    if json_output {
+        // Include layer size/digest in JSON output.
+        let mut json_val: serde_json::Value = serde_json::to_value(&pack_manifest)
+            .map_err(|e| Error::agent("serialize", e.to_string()))?;
+        if let Some(obj) = json_val.as_object_mut() {
+            obj.insert(
+                "layer_size".to_string(),
+                serde_json::Value::Number(layer_size.into()),
+            );
+            obj.insert(
+                "layer_digest".to_string(),
+                serde_json::Value::String(layer_digest.to_string()),
+            );
+        }
+        let json_str = serde_json::to_string_pretty(&json_val)
+            .map_err(|e| Error::agent("serialize inspect output", e.to_string()))?;
+        println!("{}", json_str);
+    } else {
+        let full_ref = format!("{}/{}:{}", parsed.registry, repo, tag_or_digest);
+        println!("Reference:  {}", full_ref);
+        println!("Image:      {}", pack_manifest.image);
+        println!("Platform:   {}", pack_manifest.platform);
+        println!("Host:       {}", pack_manifest.host_platform);
+        println!("CPUs:       {}", pack_manifest.cpus);
+        println!("Memory:     {} MiB", pack_manifest.mem);
+        if !pack_manifest.entrypoint.is_empty() {
+            println!("Entrypoint: {}", pack_manifest.entrypoint.join(" "));
+        }
+        if !pack_manifest.cmd.is_empty() {
+            println!("Cmd:        {}", pack_manifest.cmd.join(" "));
+        }
+        if let Some(ref wd) = pack_manifest.workdir {
+            println!("Workdir:    {}", wd);
+        }
+        println!("Created:    {}", pack_manifest.created);
+        println!("Version:    {}", pack_manifest.smolvm_version);
+        println!("Size:       {}", crate::cli::format_bytes(layer_size));
+        println!("Digest:     {}", layer_digest);
+    }
+
+    Ok(())
+}
+
+/// Build a `RegistryClient` from a registry hostname, applying auth from config.
+fn build_registry_client(
+    registry: &str,
+    config: &smolvm::registry::RegistryConfig,
+) -> smolvm::Result<smolvm_registry::RegistryClient> {
+    let base_url = if registry.starts_with("localhost") || registry.contains("127.0.0.1") {
+        format!("http://{}", registry)
+    } else {
+        format!("https://{}", registry)
+    };
+
+    let mut client = smolvm_registry::RegistryClient::new(base_url);
+
+    if let Some(auth) = config.get_credentials(registry) {
+        client = client.with_token(auth.password);
+    }
+
+    Ok(client)
 }
 
 /// Calculate the total size of a directory (recursive).
