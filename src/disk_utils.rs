@@ -27,6 +27,9 @@ pub(crate) fn find_e2fsprogs_tool(name: &str) -> Option<String> {
     }
 
     if std::process::Command::new(name)
+        // Every e2fsprogs tool we care about supports `--version`; this is
+        // the cheapest non-destructive probe that confirms the binary is
+        // present on PATH and executable before we try to use it for real.
         .arg("--version")
         .output()
         .is_ok()
@@ -192,14 +195,30 @@ pub(crate) fn format_disk_with_mkfs<D: DiskType>(disk_path: &Path) -> Result<()>
 
     let output = std::process::Command::new(mkfs_path)
         .args([
+            // Force creation on a regular file rather than requiring a block
+            // device. Our "disk" here is a raw sparse image file on the host.
             "-F",
+            // Quiet mode keeps stderr/stdout small on success. We only need the
+            // detailed mkfs output when the command fails.
             "-q",
+            // Set the reserved-blocks percentage flag.
             "-m",
+            // Reserve 0% of blocks for root. This is a VM-owned data disk, not
+            // a host root filesystem, so holding capacity back for root is just
+            // wasted space.
             "0",
+            // Specify ext4 feature flags explicitly.
             "-O",
+            // Disable the journal. These disks are scratch/data images managed
+            // by a VM, and dropping the journal reduces write amplification and
+            // space overhead for our use case.
             "^has_journal",
+            // Set the filesystem label.
             "-L",
+            // The label lets the guest-side tooling distinguish storage and
+            // overlay disks in logs and inspection output.
             D::VOLUME_LABEL,
+            // The target sparse image file to format.
             path_str,
         ])
         .output()

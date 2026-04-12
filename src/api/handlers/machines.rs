@@ -26,18 +26,29 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{AgentManager, HostMount};
+use crate::agent::{AgentClient, AgentManager, HostMount};
 use crate::api::error::ApiError;
-use crate::api::state::{ApiState, MachineEntry};
+use crate::api::state::{
+    vm_resources_to_spec, ApiState, MachineEntry, MachineRegistration, ReservationGuard,
+};
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse,
-    ListMachinesResponse, MachineExecRequest, MachineInfo, MountSpec, PortSpec,
+    ListMachinesResponse, MachineExecRequest, MachineInfo, MountInfo, MountSpec, PortSpec,
     ResizeMachineRequest, ResourceSpec,
 };
 use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::validate_vm_name;
+use crate::process::{
+    is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
+    VM_SIGTERM_TIMEOUT,
+};
+use crate::storage::{
+    expand_disk, Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB,
+};
+use crate::util::generate_machine_name;
+use crate::Error as SmolvmError;
 
 /// Re-export of the shared resolver. The CLI and API list endpoints
 /// must compute state the same way, otherwise `machine list` (CLI)
@@ -66,19 +77,17 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
             .mounts
             .iter()
             .enumerate()
-            .map(
-                |(i, (source, target, readonly))| crate::api::types::MountInfo {
-                    tag: crate::data::storage::HostMount::mount_tag(i),
-                    source: source.clone(),
-                    target: target.clone(),
-                    readonly: *readonly,
-                },
-            )
+            .map(|(i, (source, target, readonly))| MountInfo {
+                tag: HostMount::mount_tag(i),
+                source: source.clone(),
+                target: target.clone(),
+                readonly: *readonly,
+            })
             .collect(),
         ports: record
             .ports
             .iter()
-            .map(|(host, guest)| crate::api::types::PortSpec {
+            .map(|(host, guest)| PortSpec {
                 host: *host,
                 guest: *guest,
             })
@@ -117,7 +126,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         manager,
         mounts,
         ports,
-        resources: crate::api::state::vm_resources_to_spec(record.vm_resources()),
+        resources: vm_resources_to_spec(record.vm_resources()),
         restart: record.restart.clone(),
         network: record.network,
     }
@@ -134,7 +143,7 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
     let manager = AgentManager::for_vm(name).ok();
     let mut vsock_confirmed = false;
     if let Some(ref manager) = manager {
-        if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
+        if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
             vsock_confirmed = true;
             let _ = client.shutdown();
         }
@@ -146,28 +155,23 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
         // We intentionally do NOT use the lenient is_our_process() here because
         // it treats any alive PID as "ours" when start_time is None — which risks
         // killing an unrelated process if the OS reused the PID.
-        let identity_ok =
-            vsock_confirmed || crate::process::is_our_process_strict(pid, pid_start_time);
+        let identity_ok = vsock_confirmed || is_our_process_strict(pid, pid_start_time);
 
         if identity_ok {
-            let _ = crate::process::stop_vm_process(
-                pid,
-                crate::process::VM_SIGTERM_TIMEOUT,
-                crate::process::VM_SIGKILL_TIMEOUT,
-            );
+            let _ = stop_vm_process(pid, VM_SIGTERM_TIMEOUT, VM_SIGKILL_TIMEOUT);
         } else {
             tracing::debug!(pid, name, "PID already dead");
         }
 
         // Post-check: verify the process is actually gone.
-        if crate::process::is_alive(pid) {
+        if is_alive(pid) {
             tracing::warn!(pid, name, "process still alive after shutdown attempts");
             return false;
         }
     } else {
         // No PID available — check if VM is still reachable via vsock.
         if let Some(ref manager) = manager {
-            if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
+            if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
                 if client.ping().is_ok() {
                     tracing::warn!(name, "VM still reachable via vsock but no PID to signal");
                     return false;
@@ -195,13 +199,8 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    use crate::api::state::{MachineRegistration, ReservationGuard};
-
     // Generate name if not provided, then validate.
-    let name = req
-        .name
-        .clone()
-        .unwrap_or_else(crate::util::generate_machine_name);
+    let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
     // Validate mount paths
@@ -409,7 +408,7 @@ pub async fn start_machine(
     state.insert_machine(&name, machine_entry_from_record(&record, manager));
 
     // Capture start time for PID verification
-    let pid_start_time = pid.and_then(crate::process::process_start_time);
+    let pid_start_time = pid.and_then(process_start_time);
 
     // Persist state to database
     let record = db
@@ -610,10 +609,10 @@ pub async fn exec_machine(
     let result = tokio::task::spawn_blocking(move || {
         // Get manager and check if running
         let manager = AgentManager::for_vm(&name_clone)
-            .map_err(|e| crate::Error::agent("create agent manager", e.to_string()))?;
+            .map_err(|e| SmolvmError::agent("create agent manager", e.to_string()))?;
 
         if manager.try_connect_existing().is_none() {
-            return Err(crate::Error::InvalidState {
+            return Err(SmolvmError::InvalidState {
                 expected: "running".into(),
                 actual: "stopped".into(),
             });
@@ -622,13 +621,13 @@ pub async fn exec_machine(
         // Execute command
         let mut client = manager
             .connect()
-            .map_err(|e| crate::Error::agent("connect", e.to_string()))?;
+            .map_err(|e| SmolvmError::agent("connect", e.to_string()))?;
         if let Some(tid) = tid {
             client.set_trace_id(tid);
         }
         let (exit_code, stdout, stderr) = client
             .vm_exec(command, env, workdir, timeout)
-            .map_err(|e| crate::Error::agent("exec", e.to_string()))?;
+            .map_err(|e| SmolvmError::agent("exec", e.to_string()))?;
 
         // Keep VM running (persistent)
         manager.detach();
@@ -686,12 +685,8 @@ pub async fn resize_machine(
         }
     }
 
-    let current_storage_gb = record
-        .storage_gb
-        .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
-    let current_overlay_gb = record
-        .overlay_gb
-        .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
+    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
 
     if req.storage_gb.unwrap_or(current_storage_gb) < current_storage_gb {
         return Err(ApiError::BadRequest(format!(
@@ -712,13 +707,13 @@ pub async fn resize_machine(
         ));
     }
 
-    let manager = crate::agent::AgentManager::for_vm(&name)
+    let manager = AgentManager::for_vm(&name)
         .map_err(|e| ApiError::internal(format!("failed to get agent manager: {}", e)))?;
 
     if let Some(storage_gb) = req.storage_gb {
         if storage_gb > current_storage_gb {
             let storage_path = manager.storage_path();
-            crate::storage::expand_disk::<crate::storage::Storage>(storage_path, storage_gb)
+            expand_disk::<Storage>(storage_path, storage_gb)
                 .map_err(|e| ApiError::internal(format!("failed to expand storage: {}", e)))?;
         }
     }
@@ -726,7 +721,7 @@ pub async fn resize_machine(
     if let Some(overlay_gb) = req.overlay_gb {
         if overlay_gb > current_overlay_gb {
             let overlay_path = manager.overlay_path();
-            crate::storage::expand_disk::<crate::storage::Overlay>(overlay_path, overlay_gb)
+            expand_disk::<Overlay>(overlay_path, overlay_gb)
                 .map_err(|e| ApiError::internal(format!("failed to expand overlay: {}", e)))?;
         }
     }
