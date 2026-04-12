@@ -68,8 +68,8 @@ pub fn ensure_running_and_connect(
         return Err(smolvm::Error::agent(
             "connect",
             format!(
-                "machine '{}' is not running. Use 'smolvm machine start' first.",
-                label
+                "machine '{}' is not running. Use 'smolvm machine start --name {}' first.",
+                label, label
             ),
         ));
     }
@@ -211,7 +211,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
         println!("  Init commands: {}", params.init.len());
     }
     println!(
-        "\nUse 'smolvm machine start {}' to start the machine",
+        "\nUse 'smolvm machine start --name {}' to start the machine",
         params.name
     );
     println!(
