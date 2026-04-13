@@ -1117,15 +1117,7 @@ impl AgentClient {
         }
     }
 
-    /// Streaming file upload. Called by [`Self::write_file`] for
-    /// payloads above [`FILE_WRITE_SINGLE_SHOT_MAX`].
-    ///
-    /// Sends one `FileWriteBegin` (opens the guest-side session and
-    /// pre-creates the staging file), then chunks of
-    /// [`FILE_WRITE_CHUNK_SIZE`] bytes, with `done: true` on the
-    /// last chunk. Any mid-stream failure is surfaced as an error;
-    /// the agent cleans up its staging file via `Drop` on the
-    /// `WriteSession`, so no partial file ever appears at `path`.
+    /// Streaming file upload from a `&[u8]` slice.
     fn write_file_streaming<F: FnMut(u64)>(
         &mut self,
         path: &str,
@@ -1133,35 +1125,112 @@ impl AgentClient {
         mode: Option<u32>,
         on_progress: &mut F,
     ) -> Result<()> {
-        let total = data.len() as u64;
+        self.write_file_streaming_from_reader(
+            path,
+            &mut std::io::Cursor::new(data),
+            data.len() as u64,
+            mode,
+            on_progress,
+        )
+    }
+
+    /// Stream a file from a [`Read`] source into the VM.
+    ///
+    /// Reads `FILE_WRITE_CHUNK_SIZE` bytes at a time from `reader`,
+    /// sending each chunk over the protocol. Only one chunk is in
+    /// memory at a time — the caller doesn't need to buffer the
+    /// entire file.
+    pub fn write_file_from_reader<R: std::io::Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        total_size: u64,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.write_file_from_reader_with_progress(path, reader, total_size, mode, |_| {})
+    }
+
+    /// Stream a file from a [`Read`] source with progress callback.
+    pub fn write_file_from_reader_with_progress<R: std::io::Read, F: FnMut(u64)>(
+        &mut self,
+        path: &str,
+        reader: R,
+        total_size: u64,
+        mode: Option<u32>,
+        mut on_progress: F,
+    ) -> Result<()> {
+        if total_size <= FILE_WRITE_SINGLE_SHOT_MAX as u64 {
+            // Small file: read into memory and use single-shot path.
+            let mut data = Vec::with_capacity(total_size as usize);
+            std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size + 1), &mut data)
+                .map_err(|e| Error::agent("read source file", e.to_string()))?;
+            return self.write_file_with_progress(path, &data, mode, on_progress);
+        }
+        self.write_file_streaming_from_reader(
+            path,
+            &mut { reader },
+            total_size,
+            mode,
+            &mut on_progress,
+        )
+    }
+
+    /// Core streaming upload loop. Reads chunks from `reader` and
+    /// sends them over the protocol. Only one chunk buffer is live
+    /// at a time (~1 MiB).
+    fn write_file_streaming_from_reader<R: std::io::Read, F: FnMut(u64)>(
+        &mut self,
+        path: &str,
+        reader: &mut R,
+        total_size: u64,
+        mode: Option<u32>,
+        on_progress: &mut F,
+    ) -> Result<()> {
         let resp = self.request(&AgentRequest::FileWriteBegin {
             path: path.to_string(),
             mode,
-            total_size: total,
+            total_size,
         })?;
         expect_ok(resp, "begin streaming write")?;
 
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let end = (offset + FILE_WRITE_CHUNK_SIZE).min(data.len());
-            let done = end == data.len();
+        let mut buf = vec![0u8; FILE_WRITE_CHUNK_SIZE];
+        let mut bytes_sent = 0u64;
+
+        loop {
+            // Fill the chunk buffer.
+            let mut filled = 0;
+            while filled < buf.len() {
+                match reader.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(Error::agent("read source file", e.to_string())),
+                }
+            }
+
+            if filled == 0 {
+                // EOF — send final empty chunk to finalize.
+                let resp = self.request(&AgentRequest::FileWriteChunk {
+                    data: Vec::new(),
+                    done: true,
+                })?;
+                expect_ok(resp, "finalize streaming write")?;
+                break;
+            }
+
+            bytes_sent += filled as u64;
+            let done = bytes_sent >= total_size;
+
             let resp = self.request(&AgentRequest::FileWriteChunk {
-                data: data[offset..end].to_vec(),
+                data: buf[..filled].to_vec(),
                 done,
             })?;
             expect_ok(resp, "stream write chunk")?;
-            offset = end;
-            on_progress(offset as u64);
-        }
-        // Zero-length file: still need a final chunk with done=true
-        // so the agent renames the empty staging file onto the target.
-        if data.is_empty() {
-            let resp = self.request(&AgentRequest::FileWriteChunk {
-                data: Vec::new(),
-                done: true,
-            })?;
-            expect_ok(resp, "finalize empty streaming write")?;
-            on_progress(0);
+            on_progress(bytes_sent);
+
+            if done {
+                break;
+            }
         }
         Ok(())
     }
@@ -1203,6 +1272,71 @@ impl AgentClient {
         })?;
 
         consume_streamed_read_with_progress(|| self.recv_raw(), on_progress)
+    }
+
+    /// Download a file from the VM directly to a local path.
+    ///
+    /// Unlike [`Self::read_file`] which accumulates the entire file
+    /// in memory, this writes each chunk to disk as it arrives —
+    /// only one 16 MiB chunk is in memory at a time.
+    pub fn read_file_to_path<F: FnMut(u64)>(
+        &mut self,
+        guest_path: &str,
+        local_path: &std::path::Path,
+        mut on_progress: F,
+    ) -> Result<u64> {
+        use std::io::Write;
+        const FILE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+        let _timeout_guard = self.set_extended_read_timeout(FILE_READ_TIMEOUT)?;
+        self.send_raw(&AgentRequest::FileRead {
+            path: guest_path.to_string(),
+        })?;
+
+        let mut file = std::fs::File::create(local_path).map_err(|e| {
+            Error::agent(
+                "write local file",
+                format!("{}: {}", local_path.display(), e),
+            )
+        })?;
+
+        let mut total = 0u64;
+        loop {
+            match self.recv_raw()? {
+                AgentResponse::DataChunk { data, done } => {
+                    let next_total = total.saturating_add(data.len() as u64);
+                    if next_total > FILE_TRANSFER_MAX_TOTAL {
+                        let _ = std::fs::remove_file(local_path);
+                        return Err(Error::agent(
+                            "read file",
+                            format!(
+                                "guest streamed {} bytes, exceeding the {} byte cap",
+                                next_total, FILE_TRANSFER_MAX_TOTAL
+                            ),
+                        ));
+                    }
+                    if !data.is_empty() {
+                        file.write_all(&data)
+                            .map_err(|e| Error::agent("write local file", e.to_string()))?;
+                        total = next_total;
+                        on_progress(total);
+                    }
+                    if done {
+                        file.flush()
+                            .map_err(|e| Error::agent("flush local file", e.to_string()))?;
+                        return Ok(total);
+                    }
+                }
+                AgentResponse::Error { message, .. } => {
+                    let _ = std::fs::remove_file(local_path);
+                    return Err(Error::agent("read file", message));
+                }
+                _ => {
+                    let _ = std::fs::remove_file(local_path);
+                    return Err(Error::agent("read file", "unexpected response"));
+                }
+            }
+        }
     }
 
     // ========================================================================
