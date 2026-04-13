@@ -242,8 +242,8 @@ impl PackCreateCmd {
         manager.start_with_config(
             Vec::new(),
             VmResources {
-                cpus: 2,
-                memory_mib: 512,
+                cpus: 4,
+                memory_mib: 8192,
                 network: true,
                 storage_gib: None,
                 overlay_gib: None,
