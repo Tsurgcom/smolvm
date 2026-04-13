@@ -1351,20 +1351,33 @@ impl CpCmd {
             let data = std::fs::read(&local_path).map_err(|e| {
                 smolvm::Error::agent("read local file", format!("{}: {}", local_path, e))
             })?;
-            let size = data.len();
-            client.write_file(&guest_path, &data, None)?;
-            eprintln!("Uploaded {} ({} bytes) -> {}", local_path, size, guest_path);
+            let size = data.len() as u64;
+            // Total is known up front since we read into memory above.
+            // Throttled progress goes to stderr so cp output to a pipe
+            // (e.g., `> /dev/null`) doesn't capture it.
+            let mut bar = crate::cli::ProgressBar::new(
+                format!("Uploading {} -> {}", local_path, guest_path),
+                Some(size),
+            );
+            client.write_file_with_progress(&guest_path, &data, None, |sent| {
+                bar.update(sent);
+            })?;
+            bar.finish(size);
         } else {
-            let data = client.read_file(&guest_path)?;
+            // Total unknown until the agent finishes streaming. We
+            // still report bytes-so-far + rate so the user knows
+            // something is happening on big downloads.
+            let mut bar = crate::cli::ProgressBar::new(
+                format!("Downloading {} -> {}", guest_path, local_path),
+                None,
+            );
+            let data =
+                client.read_file_with_progress(&guest_path, |received| bar.update(received))?;
+            let size = data.len() as u64;
             std::fs::write(&local_path, &data).map_err(|e| {
                 smolvm::Error::agent("write local file", format!("{}: {}", local_path, e))
             })?;
-            eprintln!(
-                "Downloaded {} ({} bytes) -> {}",
-                guest_path,
-                data.len(),
-                local_path
-            );
+            bar.finish(size);
         }
 
         Ok(())
