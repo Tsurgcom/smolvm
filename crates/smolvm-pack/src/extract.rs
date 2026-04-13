@@ -9,6 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 /// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
@@ -96,7 +98,19 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             ));
         }
 
-        // Unpack the individual entry
+        // Unpack the individual entry.
+        // Ensure parent directories are writable before extracting. OCI layer
+        // tars may set restrictive directory modes (e.g., dr-xr-xr-x) before
+        // child entries, which prevents creating files under them on macOS
+        // where we're not root.
+        if entry_type != tar::EntryType::Directory {
+            if let Some(parent) = full_path.parent() {
+                if parent.is_dir() {
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
         entry.unpack_in(dest)?;
     }
     Ok(())

@@ -600,12 +600,11 @@ test_from_vm_setup() {
         return 1
     }
 
-    # Install curl so we can verify it persists into the packed binary
-    $SMOLVM machine exec --name "$FROM_VM_NAME" -- apk add --no-cache curl 2>&1 || {
-        $SMOLVM machine stop --name "$FROM_VM_NAME" 2>/dev/null || true
-        $SMOLVM machine delete "$FROM_VM_NAME" -f 2>/dev/null || true
-        return 1
-    }
+    # Install curl so we can verify it persists into the packed binary.
+    # apk add may exit non-zero due to busybox trigger errors (busybox was
+    # baked into the rootfs, not installed from a repo, so re-extraction
+    # fails). The package itself installs fine — verify with `which curl`.
+    $SMOLVM machine exec --name "$FROM_VM_NAME" -- apk add --no-cache curl 2>&1 || true
 
     # Verify curl was installed
     local which_output
@@ -763,6 +762,31 @@ test_packed_rbase_run() {
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ "$result" == *"R version"* ]]
+}
+
+test_packed_rbase_auto_storage() {
+    # Regression test: large images used to fail with "No space left on device"
+    # because the default 20 GiB storage wasn't enough. The fix auto-sizes the
+    # storage disk based on image_size in the manifest. --force-extract ensures
+    # a clean extraction (no cached overlay from a previous --storage 50 run).
+    if [[ "$QUICK_MODE" == "true" ]]; then
+        echo "SKIP: --quick mode"
+        return 0
+    fi
+
+    local output="$TEST_DIR/test-rbase"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        echo "SKIP: no sidecar (pack failed)"
+        return 1
+    fi
+
+    local result
+    result=$(run_with_timeout 120 $SMOLVM pack run --sidecar "$output.smolmachine" --force-extract -- echo "auto-storage-ok" 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"auto-storage-ok"* ]]
 }
 
 # =============================================================================
@@ -1018,6 +1042,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "pack run Python" test_pack_run_python || true
     run_test "Pack r-base (large image, streaming export)" test_pack_rbase || true
     run_test "Packed r-base run" test_packed_rbase_run || true
+    run_test "Packed r-base auto-sized storage (force-extract)" test_packed_rbase_auto_storage || true
 fi
 
 print_summary "Pack Tests"

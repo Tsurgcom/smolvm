@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use crate::format::{AssetEntry, AssetInventory, LayerEntry};
 use crate::{PackError, Result};
 
-/// Compression level for zstd (19 = high compression).
-pub const ZSTD_LEVEL: i32 = 19;
+/// Compression level for zstd (3 = zstd default, fast with good ratio).
+/// Level 19 was ~100x slower for only ~10% better compression.
+pub const ZSTD_LEVEL: i32 = 3;
 
 /// Find a pre-formatted disk template by filename.
 ///

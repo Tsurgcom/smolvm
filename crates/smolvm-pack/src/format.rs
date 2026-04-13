@@ -318,6 +318,11 @@ pub struct PackManifest {
     /// Default memory in MiB.
     pub mem: u32,
 
+    /// Total extracted (on-disk) image size in bytes.
+    /// Used to auto-size the storage disk at runtime.
+    #[serde(default)]
+    pub image_size: u64,
+
     /// Host platform this .smolmachine runs on (e.g., "darwin/arm64").
     /// Distinct from `platform` which is the guest architecture (always linux).
     /// Used for registry Image Index resolution.
@@ -400,6 +405,7 @@ impl PackManifest {
             workdir: None,
             cpus: 1,
             mem: 256,
+            image_size: 0,
             host_platform,
             created: rfc3339_now(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),

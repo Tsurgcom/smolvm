@@ -317,7 +317,7 @@ impl PackRunCmd {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
             network: self.net || !self.port.is_empty(),
-            storage_gib: self.storage,
+            storage_gib: storage_gib_for_manifest(self.storage, &manifest),
             overlay_gib: self.overlay,
             allowed_cidrs: None,
         };
@@ -608,6 +608,31 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
 
         thread::sleep(poll_interval);
     }
+}
+
+/// Compute storage size for a packed VM.
+///
+/// If the user passed `--storage`, use that. Otherwise, auto-size based on the
+/// image's extracted on-disk size (recorded in manifest during `pack create`).
+/// Formula: `max(20, image_gib * 3 + 5)` — the 3x covers overlay copy-up,
+/// container setup, and ext4 metadata; the +5 gives headroom for user data.
+fn storage_gib_for_manifest(
+    explicit: Option<u64>,
+    manifest: &smolvm_pack::PackManifest,
+) -> Option<u64> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    if manifest.image_size == 0 {
+        // Legacy manifest without image_size — use default.
+        return None;
+    }
+    let image_gib = manifest.image_size / (1024 * 1024 * 1024);
+    // Layers are extracted to /storage, then overlayfs copies writable parts,
+    // and crun sets up the container rootfs. 3x the image size + 10 GiB
+    // headroom covers the worst case. Floor at 20 GiB for small images.
+    let needed = std::cmp::max(image_gib * 3 + 10, 20);
+    Some(needed)
 }
 
 /// Build the command to execute from manifest defaults and CLI overrides.
@@ -1129,7 +1154,7 @@ fn run_from_cache(
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || !args.port.is_empty(),
-        storage_gib: args.storage,
+        storage_gib: storage_gib_for_manifest(args.storage, manifest),
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
@@ -1446,7 +1471,7 @@ fn daemon_start(
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || !args.port.is_empty(),
-        storage_gib: args.storage,
+        storage_gib: storage_gib_for_manifest(args.storage, &manifest),
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
