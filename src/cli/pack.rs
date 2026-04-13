@@ -8,7 +8,7 @@
 //! - Configuration manifest
 
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
+use smolvm::agent::{AgentClient, AgentManager, VmResources};
 use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
@@ -258,12 +258,11 @@ impl PackCreateCmd {
         let mut client = guard.manager.connect()?;
 
         // Pull image
-        println!("Pulling {}...", image);
-        let mut pull_opts = PullOptions::new().use_registry_config(true);
-        if let Some(ref oci_platform) = pack_config.oci_platform {
-            pull_opts = pull_opts.oci_platform(oci_platform);
-        }
-        let image_info = client.pull(&image, pull_opts)?;
+        let image_info = crate::cli::pull_with_progress(
+            &mut client,
+            &image,
+            pack_config.oci_platform.as_deref(),
+        )?;
         debug!(image_info = ?image_info, "image pulled");
 
         println!(
