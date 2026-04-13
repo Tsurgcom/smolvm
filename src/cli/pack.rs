@@ -307,6 +307,7 @@ impl PackCreateCmd {
         let host_platform = Platform::current().host_oci_platform().to_string();
         let mut manifest =
             PackManifest::new(image, image_info.digest.clone(), platform, host_platform);
+        manifest.image_size = image_info.size;
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
 
