@@ -61,11 +61,17 @@ impl AuthConfig {
         }
 
         let contents = std::fs::read_to_string(&path).map_err(|e| {
-            Error::config(format!("read auth config at {}", path.display()), e.to_string())
+            Error::config(
+                format!("read auth config at {}", path.display()),
+                e.to_string(),
+            )
         })?;
 
         let config: Self = serde_json::from_str(&contents).map_err(|e| {
-            Error::config(format!("parse auth config at {}", path.display()), e.to_string())
+            Error::config(
+                format!("parse auth config at {}", path.display()),
+                e.to_string(),
+            )
         })?;
 
         Ok(config)
@@ -75,17 +81,18 @@ impl AuthConfig {
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::config("create config directory", e.to_string())
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::config("create config directory", e.to_string()))?;
         }
 
-        let contents = serde_json::to_string_pretty(self).map_err(|e| {
-            Error::config("serialize auth config", e.to_string())
-        })?;
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|e| Error::config("serialize auth config", e.to_string()))?;
 
         std::fs::write(&path, &contents).map_err(|e| {
-            Error::config(format!("write auth config to {}", path.display()), e.to_string())
+            Error::config(
+                format!("write auth config to {}", path.display()),
+                e.to_string(),
+            )
         })?;
 
         // Set file permissions to 0600 (owner read/write only)
@@ -93,9 +100,8 @@ impl AuthConfig {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, perms).map_err(|e| {
-                Error::config("set auth config permissions", e.to_string())
-            })?;
+            std::fs::set_permissions(&path, perms)
+                .map_err(|e| Error::config("set auth config permissions", e.to_string()))?;
         }
 
         Ok(())
@@ -204,12 +210,12 @@ impl OidcProvider {
 
     /// Build from environment variables, falling back to built-in defaults.
     fn from_env_or_defaults() -> Self {
-        let issuer = std::env::var("SMOLVM_OIDC_ISSUER")
-            .unwrap_or_else(|_| DEFAULT_ISSUER.to_string());
+        let issuer =
+            std::env::var("SMOLVM_OIDC_ISSUER").unwrap_or_else(|_| DEFAULT_ISSUER.to_string());
         let client_id = std::env::var("SMOLVM_OIDC_CLIENT_ID")
             .unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
-        let audience = std::env::var("SMOLVM_OIDC_AUDIENCE")
-            .unwrap_or_else(|_| DEFAULT_AUDIENCE.to_string());
+        let audience =
+            std::env::var("SMOLVM_OIDC_AUDIENCE").unwrap_or_else(|_| DEFAULT_AUDIENCE.to_string());
 
         Self {
             issuer,
@@ -294,7 +300,10 @@ mod tests {
             },
         );
 
-        assert_eq!(config.get_token("registry.example.com"), Some("valid_token"));
+        assert_eq!(
+            config.get_token("registry.example.com"),
+            Some("valid_token")
+        );
     }
 
     #[test]
@@ -359,8 +368,14 @@ mod tests {
             token_endpoint: Some("https://custom.example.com/token".to_string()),
             ..OidcProvider::default()
         };
-        assert_eq!(provider.device_endpoint(), "https://custom.example.com/device");
-        assert_eq!(provider.token_endpoint(), "https://custom.example.com/token");
+        assert_eq!(
+            provider.device_endpoint(),
+            "https://custom.example.com/device"
+        );
+        assert_eq!(
+            provider.token_endpoint(),
+            "https://custom.example.com/token"
+        );
     }
 
     #[test]

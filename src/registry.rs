@@ -182,10 +182,7 @@ impl RegistryConfig {
 
     /// Set credentials for a registry, creating the entry if needed.
     pub fn set_credentials(&mut self, registry: &str, username: String, password: String) {
-        let entry = self
-            .registries
-            .entry(registry.to_string())
-            .or_insert_with(RegistryEntry::default);
+        let entry = self.registries.entry(registry.to_string()).or_default();
         entry.username = Some(username);
         entry.password = Some(password);
         entry.password_env = None;
@@ -195,13 +192,11 @@ impl RegistryConfig {
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path()?;
         if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::config("create config directory", e.to_string())
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::config("create config directory", e.to_string()))?;
         }
-        let contents = toml::to_string_pretty(self).map_err(|e| {
-            Error::config("serialize registry config", e.to_string())
-        })?;
+        let contents = toml::to_string_pretty(self)
+            .map_err(|e| Error::config("serialize registry config", e.to_string()))?;
         std::fs::write(&config_path, contents).map_err(|e| {
             Error::config(
                 format!("write registry config to {}", config_path.display()),
@@ -897,7 +892,11 @@ mirror = "ghcr-mirror.example.com"
         let config_path = dir.path().join("registries.toml");
 
         let mut config = RegistryConfig::default();
-        config.set_credentials("registry.smolmachines.com", "testuser".into(), "testpass".into());
+        config.set_credentials(
+            "registry.smolmachines.com",
+            "testuser".into(),
+            "testpass".into(),
+        );
 
         // Write manually to the temp path (save() uses the real config path)
         let contents = toml::to_string_pretty(&config).unwrap();
@@ -906,7 +905,9 @@ mirror = "ghcr-mirror.example.com"
         // Reload and verify
         let reloaded: RegistryConfig =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        let creds = reloaded.get_credentials("registry.smolmachines.com").unwrap();
+        let creds = reloaded
+            .get_credentials("registry.smolmachines.com")
+            .unwrap();
         assert_eq!(creds.username, "testuser");
         assert_eq!(creds.password, "testpass");
     }
