@@ -1,38 +1,10 @@
-//! Single-binary packaging for smolvm.
+//! `.smolmachine` packaging for smolvm.
 //!
 //! This crate provides functionality to package an OCI image and all runtime assets
-//! into a self-contained executable that can be distributed and run without smolvm installed.
+//! into a portable `.smolmachine` artifact that can be pushed to a registry,
+//! distributed, and run without smolvm installed.
 //!
-//! # Binary Format (Version 2 - Sidecar)
-//!
-//! Two files are created:
-//!
-//! **Binary file:**
-//! ```text
-//! +---------------------------+
-//! | Stub Executable           |  ~500KB
-//! +---------------------------+
-//! | Manifest (JSON)           |  ~2KB
-//! +---------------------------+
-//! | Footer (64 bytes)         |
-//! |  - magic: "SMOLPACK"      |
-//! |  - version, offsets       |
-//! |  - checksum               |
-//! +---------------------------+
-//! ```
-//!
-//! **Sidecar file (.smolmachine):**
-//! ```text
-//! +---------------------------+
-//! | Assets Blob (zstd)        |  30-150MB
-//! |  - lib/libkrun.dylib      |
-//! |  - lib/libkrunfw.5.dylib  |
-//! |  - agent-rootfs.tar       |
-//! |  - layers/*.tar           |
-//! +---------------------------+
-//! ```
-//!
-//! This allows proper code signing on macOS while keeping distribution simple.
+//! See [`format`] for the full binary format specification.
 
 #![deny(missing_docs)]
 

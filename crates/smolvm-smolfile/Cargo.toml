@@ -1,0 +1,16 @@
+[package]
+name = "smolfile"
+version = "0.1.0"
+edition = "2021"
+description = "Smolfile specification and parser for smolvm microVM workloads"
+license = "Apache-2.0"
+repository = "https://github.com/smol-machines/smolvm"
+keywords = ["smolvm", "microvm", "configuration"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"

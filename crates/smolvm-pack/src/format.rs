@@ -1,7 +1,47 @@
-//! Binary format definitions for packed executables.
+//! `.smolmachine` binary format specification.
 //!
-//! This module defines the footer and manifest structures that describe
-//! the contents of a packed smolvm executable.
+//! # Overview
+//!
+//! A `.smolmachine` is a portable, self-contained microVM artifact. It bundles
+//! everything needed to run a workload: OCI image layers, the agent rootfs,
+//! runtime libraries (libkrun), and a manifest describing the configuration.
+//!
+//! # File Layout
+//!
+//! A `.smolmachine` file is a zstd-compressed tar archive with a JSON manifest
+//! appended as a footer. The manifest is also stored inside the OCI registry
+//! as the config blob when pushed.
+//!
+//! ```text
+//! +---------------------------+
+//! | Assets Blob (zstd tar)    |  30-150 MB
+//! |  - agent-rootfs.tar       |  Guest init system
+//! |  - layers/*.tar           |  OCI image layers
+//! |  - lib/libkrun.*          |  Runtime libraries (platform-specific)
+//! |  - storage.ext4 (opt)     |  Pre-formatted disk template
+//! |  - overlay.raw (opt)      |  VM snapshot (VM mode only)
+//! +---------------------------+
+//! | Manifest (JSON)           |  ~2 KB (PackManifest)
+//! +---------------------------+
+//! | Footer (64 bytes)         |
+//! |  - magic: "SMOLPACK"      |
+//! |  - version: 1             |
+//! |  - offsets + sizes         |
+//! |  - CRC32 checksum         |
+//! +---------------------------+
+//! ```
+//!
+//! # OCI Registry Representation
+//!
+//! When pushed to an OCI registry, a `.smolmachine` is stored as:
+//! - **Config blob**: `PackManifest` JSON (`application/vnd.smolmachines.machine.config.v1+json`)
+//! - **Layer blob**: The full `.smolmachine` file (`application/vnd.smolmachines.smolmachine.v1`)
+//! - **Manifest**: Standard OCI Image Manifest referencing both blobs
+//!
+//! # Execution Modes
+//!
+//! - **Container mode** (default): OCI image layers are unpacked and run via crun.
+//! - **VM mode**: An overlay disk snapshot is restored directly into the VM.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +57,7 @@ pub const SECTION_MAGIC: &[u8; 8] = b"SMOLSECT";
 pub const LIBS_MAGIC: &[u8; 8] = b"SMOLLIBS";
 
 /// Current format version.
-/// Version 1: Assets appended to binary
-/// Version 2: Assets in sidecar file (.smolmachine)
-/// Version 3: Libs in stub binary, sidecar is cross-platform
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 1;
 
 /// Extension for sidecar assets file.
 pub const SIDECAR_EXTENSION: &str = ".smolmachine";

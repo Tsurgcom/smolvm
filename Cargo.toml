@@ -6,6 +6,7 @@ members = [
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
+    "crates/smolvm-smolfile",
 ]
 resolver = "2"
 
@@ -31,6 +32,7 @@ path = "src/main.rs"
 smolvm-protocol = { path = "crates/smolvm-protocol" }
 smolvm-pack = { path = "crates/smolvm-pack" }
 smolvm-registry = { path = "crates/smolvm-registry" }
+smolfile = { path = "crates/smolvm-smolfile" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,10 +1,8 @@
 //! Binary packer for assembling packed executables.
 //!
 //! This module handles combining the stub executable, compressed assets,
-//! manifest, and footer into a self-contained package.
-//!
-//! Format version 2 uses a sidecar file for assets (.smolmachine) to allow
-//! proper code signing on macOS.
+//! manifest, and footer into a self-contained `.smolmachine` package.
+//! See [`crate::format`] for the binary format specification.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};

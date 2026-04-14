@@ -420,8 +420,7 @@ const LIBS_EXTRACTION_MARKER: &str = ".smolvm-libs-extracted";
 /// If found, extracts the compressed libs bundle to a cache directory and
 /// returns the path to the `lib/` directory containing libkrun/libkrunfw.
 ///
-/// Returns `None` if the binary has no embedded libs (e.g., a V2 stub or
-/// the base smolvm binary).
+/// Returns `None` if the binary has no embedded libs (e.g., the base smolvm binary).
 pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result<Option<PathBuf>> {
     use crate::format::{LibsFooter, LIBS_FOOTER_SIZE};
 
@@ -438,7 +437,7 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
 
     let footer = match LibsFooter::from_bytes(&footer_buf) {
         Ok(f) => f,
-        Err(_) => return Ok(None), // No SMOLLIBS footer — not a V3 stub
+        Err(_) => return Ok(None), // No SMOLLIBS footer — no embedded libs
     };
 
     if debug {
