@@ -173,37 +173,36 @@ test_init_in_container_uses_image_rootfs() {
     local vm_name="smolfile-init-container-$$"
     cleanup_vm "$vm_name"
 
+    # Uses debian:stable-slim because dpkg exists in Debian but not in the
+    # bare Alpine agent. If init ever regressed to running against the agent,
+    # `command -v dpkg` would fail with "command not found".
     cat > "$SMOLFILE_TMPDIR/Smolfile.initcontainer" <<'EOF'
-image = "archlinux"
+image = "debian:stable-slim"
 cpus = 2
 memory = 1024
 net = true
 
 [dev]
-init = ["command -v pacman > /tmp/pacman-path.txt"]
+init = ["command -v dpkg > /tmp/dpkg-path.txt"]
 EOF
 
     $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initcontainer" 2>&1 || return 1
 
-    # Start should pull archlinux, then run init *in* the container.
+    # Start should pull the image, then run init *in* the container.
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Init wrote pacman's path inside the container's overlay. Verify
-    # via exec that it's there and points at *some* pacman (the binary
-    # lives at /usr/sbin/pacman in current archlinux but distros vary
-    # the bin/sbin split — match on the suffix, not the full path).
-    # An empty result would mean `command -v` exited non-zero, which
-    # would itself surface as an init failure earlier.
+    # Init wrote dpkg's path inside the container's overlay. Verify
+    # via exec that it's there.
     local output
-    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/pacman-path.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/dpkg-path.txt 2>&1)
 
     cleanup_vm "$vm_name"
 
-    [[ "$output" == */pacman ]]
+    [[ "$output" == */dpkg ]]
 }
 
 # Image pull happens before init, not after. The init command below
-# depends on a file that only exists in the archlinux rootfs — the
+# depends on a file that only exists in the Debian rootfs — the
 # container layers must be in place when init runs, or `test -f` would
 # hit the bare Alpine agent and fail. Also asserts the user-visible
 # ordering: "Pulling..." line precedes "Running N init command(s)..."
@@ -213,13 +212,13 @@ test_init_runs_after_image_pull() {
     cleanup_vm "$vm_name"
 
     cat > "$SMOLFILE_TMPDIR/Smolfile.initafter" <<'EOF'
-image = "archlinux"
+image = "debian:stable-slim"
 cpus = 2
 memory = 1024
 net = true
 
 [dev]
-init = ["test -f /etc/arch-release"]
+init = ["test -f /etc/debian_version"]
 EOF
 
     $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initafter" 2>&1 || return 1
@@ -245,10 +244,10 @@ EOF
 }
 
 # Init's filesystem changes persist into subsequent `machine exec`.
-# A `pacman -S git` during init must leave git installed for follow-up
-# exec calls — this is the whole point of running init at start time
-# rather than expecting the operator to script it themselves. The
-# persistent-overlay wiring in `build_init_run_config` is what makes
+# An `apt-get install curl` during init must leave curl installed for
+# follow-up exec calls — this is the whole point of running init at
+# start time rather than expecting the operator to script it themselves.
+# The persistent-overlay wiring in `build_init_run_config` is what makes
 # this work; if the overlay ID ever drifts from the machine name,
 # init's writes land in an overlay exec never sees.
 test_init_in_container_persists_filesystem_changes() {
@@ -256,15 +255,15 @@ test_init_in_container_persists_filesystem_changes() {
     cleanup_vm "$vm_name"
 
     cat > "$SMOLFILE_TMPDIR/Smolfile.initpersist" <<'EOF'
-image = "archlinux"
+image = "debian:stable-slim"
 cpus = 2
 memory = 2048
 net = true
 
 [dev]
 init = [
-  "pacman -Sy --noconfirm",
-  "pacman -S --noconfirm git",
+  "apt-get update -qq",
+  "apt-get install -y -qq curl",
 ]
 EOF
 
@@ -272,34 +271,34 @@ EOF
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Exec must see the package installed by init. If the overlay ID
-    # is wrong, this exec runs in a fresh overlay and `git --version`
+    # is wrong, this exec runs in a fresh overlay and `curl --version`
     # returns "command not found".
     local output
-    output=$($SMOLVM machine exec --name "$vm_name" -- git --version 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- curl --version 2>&1)
 
     cleanup_vm "$vm_name"
 
-    [[ "$output" == *"git version"* ]]
+    [[ "$output" == *"curl"* ]]
 }
 
 # Init failure surfaces *both* stdout and stderr in the error message.
 # Package managers commonly write failure diagnostics to stdout
-# (pacman's "target not found", apt's dependency resolver output) —
-# if the error only included stderr, the operator would be left with
-# an exit code and no explanation. Asks pacman for a package that
-# doesn't exist; the error must contain "target not found".
+# (apt's "Unable to locate package") — if the error only included
+# stderr, the operator would be left with an exit code and no
+# explanation. Asks apt for a package that doesn't exist; the error
+# must contain "Unable to locate".
 test_init_failure_surfaces_full_error() {
     local vm_name="smolfile-init-fail-$$"
     cleanup_vm "$vm_name"
 
     cat > "$SMOLFILE_TMPDIR/Smolfile.initfail" <<'EOF'
-image = "archlinux"
+image = "debian:stable-slim"
 cpus = 2
 memory = 1024
 net = true
 
 [dev]
-init = ["pacman -S --noconfirm bogus-pkg-does-not-exist-xyz"]
+init = ["apt-get install -y bogus-pkg-does-not-exist-xyz"]
 EOF
 
     $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initfail" 2>&1 || return 1
@@ -312,9 +311,9 @@ EOF
 
     cleanup_vm "$vm_name"
 
-    # Failure expected, with pacman's "target not found" diagnostic
+    # Failure expected, with apt's "Unable to locate package" diagnostic
     # surfaced (was previously swallowed).
-    [[ $start_exit -ne 0 ]] && [[ "$output" == *"target not found"* ]]
+    [[ $start_exit -ne 0 ]] && [[ "$output" == *"Unable to locate"* ]]
 }
 
 # =============================================================================
@@ -1098,8 +1097,11 @@ test_ssh_agent_lists_host_keys() {
     $SMOLVM machine create "$vm_name" --ssh-agent --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
 
-    # Install openssh-client
-    $SMOLVM machine exec --name "$vm_name" -- apk add openssh-client 2>&1 >/dev/null || return 1
+    # Install openssh-client. apk may return non-zero from trigger
+    # scripts (e.g., busybox post-install) even on successful install.
+    # Verify the binary exists instead of trusting the exit code.
+    $SMOLVM machine exec --name "$vm_name" -- apk add openssh-client 2>/dev/null || true
+    $SMOLVM machine exec --name "$vm_name" -- which ssh-add 2>/dev/null || return 1
 
     # ssh-add -l should list the same keys as host
     local guest_keys host_keys

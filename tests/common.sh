@@ -231,8 +231,10 @@ ensure_data_dir_deleted() {
     fi
 }
 
-# Ensure machine is running
-# If net=true, recreate with --net (needed for container image pulls)
+# Ensure machine is running and reachable.
+# If net=true, recreate with --net (needed for container image pulls).
+# Handles stale "already running" state from previous tests by verifying
+# connectivity and doing a full cleanup cycle if the VM is unreachable.
 ensure_machine_running() {
     local with_net="${1:-false}"
     if [[ "$with_net" == "true" ]]; then
@@ -242,6 +244,17 @@ ensure_machine_running() {
         $SMOLVM machine create default --net 2>/dev/null || true
     fi
     $SMOLVM machine start 2>/dev/null || true
+
+    # Verify the VM is actually reachable. If it reports "running" but
+    # the process is dead (stale PID), do a full cleanup and restart.
+    if ! $SMOLVM machine exec -- true 2>/dev/null; then
+        $SMOLVM machine stop 2>/dev/null || true
+        $SMOLVM machine delete default -f 2>/dev/null || true
+        if [[ "$with_net" == "true" ]]; then
+            $SMOLVM machine create default --net 2>/dev/null || true
+        fi
+        $SMOLVM machine start 2>/dev/null || true
+    fi
 }
 
 # Extract container ID from output

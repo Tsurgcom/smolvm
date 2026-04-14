@@ -31,7 +31,7 @@ echo ""
 
 # Test output directory (cleaned up at end)
 TEST_DIR=$(mktemp -d)
-trap "rm -rf '$TEST_DIR'" EXIT
+trap "rm -rf '$TEST_DIR'; $SMOLVM pack prune --all 2>/dev/null || true" EXIT
 
 # =============================================================================
 # Pack Command - Basic Tests
@@ -869,7 +869,7 @@ test_packed_rbase_run() {
     local exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-    [[ "$result" == *"GNU R Version"* ]] || [[ "$result" == *"r ('littler') version"* ]]
+    [[ "$result" == *"R version"* ]] || [[ "$result" == *"r ('littler') version"* ]]
 }
 
 test_packed_rbase_auto_storage() {
