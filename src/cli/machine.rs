@@ -1092,6 +1092,7 @@ impl CreateCmd {
             volume: self.volume.clone(),
             port: self.port.clone(),
             net: self.net || manifest.network,
+            network_backend: self.net_backend,
             init: self.init.clone(),
             env: {
                 let mut env = manifest.env;
