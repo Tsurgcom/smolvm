@@ -75,7 +75,7 @@ smolvm pack create --image IMAGE -o PATH          # package
 smolvm pack create --from-vm NAME -o PATH         # pack from VM snapshot
 smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
 
-smolvm serve start [--listen ADDR:PORT]           # HTTP API
+smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth
 ```
 
@@ -328,7 +328,7 @@ The `.smolmachine` manifest includes registry-oriented metadata:
 
 ## HTTP API
 
-Start with `smolvm serve start --listen 127.0.0.1:8080`. Key endpoints:
+Start with `smolvm serve start --listen 127.0.0.1:8080` or `smolvm serve start --listen /tmp/smol.sock`. Key endpoints:
 
 ```
 POST   /api/v1/machines                    Create machine
