@@ -25,6 +25,32 @@ pub struct VmResources {
     pub allowed_cidrs: Option<Vec<String>>,
 }
 
+/// Minimum memory required for the VM to boot (kernel + agent).
+const MIN_MEMORY_MIB: u32 = 64;
+
+impl VmResources {
+    /// Validate resource values before starting a VM. Returns an error with
+    /// a clear message for values that would cause an opaque hypervisor failure.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.cpus == 0 {
+            return Err(crate::Error::config(
+                "validate resources",
+                "CPU count must be at least 1",
+            ));
+        }
+        if self.memory_mib < MIN_MEMORY_MIB {
+            return Err(crate::Error::config(
+                "validate resources",
+                format!(
+                    "memory must be at least {} MiB (got {} MiB)",
+                    MIN_MEMORY_MIB, self.memory_mib
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for VmResources {
     fn default() -> Self {
         Self {
