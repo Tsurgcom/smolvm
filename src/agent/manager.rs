@@ -790,6 +790,9 @@ impl AgentManager {
         ports: &[PortMapping],
         resources: VmResources,
     ) -> Result<()> {
+        // Validate resources before doing anything else.
+        resources.validate()?;
+
         // Check and update state
         {
             let mut inner = self.inner.lock();

@@ -1023,6 +1023,48 @@ run_test "Machine images" test_machine_images || true
 run_test "Machine prune --dry-run" test_machine_prune_dry_run || true
 
 # =============================================================================
+# Resource Validation
+# =============================================================================
+
+test_resource_cpus_zero_rejected() {
+    local exit_code=0
+    $SMOLVM machine run --cpus 0 -- echo hello 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || return 1
+}
+
+test_resource_mem_zero_rejected() {
+    local exit_code=0
+    $SMOLVM machine run --mem 0 -- echo hello 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || return 1
+}
+
+test_resource_mem_below_minimum_rejected() {
+    local exit_code=0
+    local output
+    output=$($SMOLVM machine run --mem 1 -- echo hello 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || return 1
+    [[ "$output" == *"at least"* ]] || return 1
+}
+
+# Regression: `machine start --name X` where X doesn't exist used to silently
+# create and start a "default" VM. Now it correctly returns an error.
+test_start_nonexistent_name_rejected() {
+    local exit_code=0
+    $SMOLVM machine start --name nonexistent-vm-regression-test 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "expected error for nonexistent VM"; return 1; }
+
+    # Verify no "default" VM was created
+    local list
+    list=$($SMOLVM machine ls --json 2>&1)
+    [[ "$list" != *"nonexistent-vm-regression-test"* ]] || { echo "VM should not exist"; return 1; }
+}
+
+run_test "Resource: --cpus 0 rejected" test_resource_cpus_zero_rejected || true
+run_test "Resource: --mem 0 rejected" test_resource_mem_zero_rejected || true
+run_test "Resource: --mem below minimum rejected" test_resource_mem_below_minimum_rejected || true
+run_test "Start --name nonexistent rejected" test_start_nonexistent_name_rejected || true
+
+# =============================================================================
 # Auto-Generated Names
 # =============================================================================
 

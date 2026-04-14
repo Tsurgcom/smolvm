@@ -961,10 +961,15 @@ pub struct StartCmd {
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
         match vm_common::start_vm_named(&name) {
             Ok(()) => Ok(()),
-            Err(smolvm::Error::VmNotFound { .. }) => vm_common::start_vm_default(),
+            Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
+                // Only fall back to creating a default VM when no --name was given.
+                // With an explicit --name, VmNotFound is a real error.
+                vm_common::start_vm_default()
+            }
             Err(e) => Err(e),
         }
     }
