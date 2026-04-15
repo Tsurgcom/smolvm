@@ -7,6 +7,3 @@
 [submodule "smolvm-sdk"]
 	path = smolvm-sdk
 	url = git@github.com:smol-machines/smolvm-sdk.git
-[submodule "smolbench"]
-	path = smolbench
-	url = git@github.com:smol-machines/smolbench.git
