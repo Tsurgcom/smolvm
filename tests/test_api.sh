@@ -21,24 +21,28 @@ log_info "Pre-flight cleanup: killing orphan processes..."
 kill_orphan_smolvm_processes
 
 # API server configuration
-API_PORT=18080
-API_URL="http://127.0.0.1:$API_PORT"
+API_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/smolvm.sock"
+API_URL="http://localhost"
 SERVER_PID=""
 MACHINE_NAME="api-test-machine"
 REGISTRY_TEST_NAME="registry-coherence-test"
+
+# API client shortcut
+CURL=(curl --unix-socket "$API_SOCKET")
 
 # =============================================================================
 # Setup / Teardown
 # =============================================================================
 
 start_server() {
-    log_info "Starting API server on port $API_PORT..."
-    $SMOLVM serve start --listen "127.0.0.1:$API_PORT" &
+    log_info "Starting API server on unix://$API_SOCKET..."
+    rm -f "$API_SOCKET"
+    $SMOLVM serve start &
     SERVER_PID=$!
 
     local retries=30
     while [[ $retries -gt 0 ]]; do
-        if curl -s "$API_URL/health" >/dev/null 2>&1; then
+        if "${CURL[@]}" -s "$API_URL/health" >/dev/null 2>&1; then
             log_info "Server started (PID: $SERVER_PID)"
             return 0
         fi
@@ -61,9 +65,9 @@ stop_server() {
 
 cleanup() {
     # Delete machines via API (this stops the VMs properly)
-    if curl -s "$API_URL/health" >/dev/null 2>&1; then
-        curl -s -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME" >/dev/null 2>&1 || true
-        curl -s -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME" >/dev/null 2>&1 || true
+    if "${CURL[@]}" -s "$API_URL/health" >/dev/null 2>&1; then
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME" >/dev/null 2>&1 || true
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME" >/dev/null 2>&1 || true
     fi
     stop_server
 
@@ -80,27 +84,27 @@ trap cleanup EXIT
 
 test_health() {
     local response
-    response=$(curl -s "$API_URL/health")
+    response=$("${CURL[@]}" -s "$API_URL/health")
     [[ "$response" == *'"status":"ok"'* ]]
 }
 
 test_create_and_start_machine() {
     # Create machine
     local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$MACHINE_NAME\", \"network\": true, \"cpus\": 1, \"mem\": 512}")
     [[ "$status" != "200" ]] && return 1
 
     # Start machine (boots VM)
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/start")
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/start")
     [[ "$response" == *'"state":"running"'* ]]
 }
 
 test_exec_echo() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["echo", "api-test-marker"]}')
     [[ "$response" == *"api-test-marker"* ]]
@@ -108,7 +112,7 @@ test_exec_echo() {
 
 test_exec_reads_vm_filesystem() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["cat", "/etc/os-release"]}')
     [[ "$response" == *"Alpine"* ]] || [[ "$response" == *"alpine"* ]]
@@ -117,14 +121,14 @@ test_exec_reads_vm_filesystem() {
 test_exec_exit_codes() {
     # Test exit code 0
     local response exit_code
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "exit 0"]}')
     exit_code=$(echo "$response" | grep -o '"exitCode":[0-9]*' | cut -d: -f2)
     [[ "$exit_code" != "0" ]] && return 1
 
     # Test exit code 42
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "exit 42"]}')
     exit_code=$(echo "$response" | grep -o '"exitCode":[0-9]*' | cut -d: -f2)
@@ -133,7 +137,7 @@ test_exec_exit_codes() {
 
 test_exec_with_env() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "echo $MY_VAR"], "env": [{"name": "MY_VAR", "value": "hello_from_api"}]}')
     [[ "$response" == *"hello_from_api"* ]]
@@ -141,7 +145,7 @@ test_exec_with_env() {
 
 test_exec_with_workdir() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["pwd"], "workdir": "/tmp"}')
     [[ "$response" == *"/tmp"* ]]
@@ -149,7 +153,7 @@ test_exec_with_workdir() {
 
 test_exec_shell_pipeline() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "echo hello world | wc -w"]}')
     [[ "$response" == *"2"* ]]
@@ -157,13 +161,13 @@ test_exec_shell_pipeline() {
 
 test_pull_and_run_image() {
     # Pull image
-    curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/images/pull" \
+    "${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/images/pull" \
         -H "Content-Type: application/json" \
         -d '{"image": "alpine:latest"}' >/dev/null
 
     # Run in image
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/run" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/run" \
         -H "Content-Type: application/json" \
         -d '{"image": "alpine:latest", "command": ["echo", "container-test"]}')
     [[ "$response" == *"container-test"* ]]
@@ -171,25 +175,25 @@ test_pull_and_run_image() {
 
 test_stop_machine() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/stop")
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/stop")
     [[ "$response" == *'"state":"stopped"'* ]] || [[ "$response" == *'"name":'* ]]
 }
 
 test_delete_machine() {
     local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME")
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME")
     [[ "$status" == "200" ]]
 }
 
 test_error_not_found() {
     local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/v1/machines/nonexistent-12345")
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" "$API_URL/api/v1/machines/nonexistent-12345")
     [[ "$status" == "404" ]]
 }
 
 test_error_bad_request() {
     local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
         -d '{"name": ""}')
     [[ "$status" == "400" ]]
@@ -204,18 +208,18 @@ test_error_bad_request() {
 test_registry_create_start_exec() {
     # Create a fresh machine
     local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$REGISTRY_TEST_NAME\", \"network\": true, \"cpus\": 1, \"mem\": 512}")
     [[ "$status" != "200" ]] && { echo "create failed: $status"; return 1; }
 
     # Start it
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME/start")
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME/start")
     [[ "$response" != *'"state":"running"'* ]] && { echo "start failed: $response"; return 1; }
 
     # Exec immediately — this is the key test. Before the registry fix, this returned 404.
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME/exec" \
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["echo", "registry-ok"]}')
     [[ "$response" == *"registry-ok"* ]]
@@ -223,16 +227,16 @@ test_registry_create_start_exec() {
 
 test_registry_get_machine() {
     local response
-    response=$(curl -s "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME")
+    response=$("${CURL[@]}" -s "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME")
     [[ "$response" == *"\"name\":\"$REGISTRY_TEST_NAME\""* ]] && \
     [[ "$response" == *'"state":"running"'* ]]
 }
 
 test_registry_cleanup() {
     # Stop + delete the registry test machine
-    curl -s -X POST "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME/stop" >/dev/null 2>&1 || true
+    "${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME/stop" >/dev/null 2>&1 || true
     local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME")
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME")
     [[ "$status" == "200" ]]
 }
 
@@ -268,7 +272,7 @@ run_test "Registry: cleanup test machine" test_registry_cleanup || true
 test_api_auto_generated_names() {
     # Without name → auto-generated vm-* name
     local response
-    response=$(curl -sf -X POST "$API_URL/api/v1/machines" \
+    response=$("${CURL[@]}" -sf -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
         -d '{"cpus": 1, "memoryMb": 512}' 2>&1) || { echo "Create failed: $response"; return 1; }
 
@@ -278,7 +282,7 @@ test_api_auto_generated_names() {
 
     # With explicit name → uses it
     local explicit="api-name-test-$$"
-    response=$(curl -sf -X POST "$API_URL/api/v1/machines" \
+    response=$("${CURL[@]}" -sf -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$explicit\", \"cpus\": 1, \"memoryMb\": 512}" 2>&1) || return 1
     local name
@@ -286,8 +290,8 @@ test_api_auto_generated_names() {
     [[ "$name" == "$explicit" ]] || { echo "Expected $explicit, got: $name"; return 1; }
 
     # Cleanup
-    curl -sf -X DELETE "$API_URL/api/v1/machines/$auto_name" 2>/dev/null
-    curl -sf -X DELETE "$API_URL/api/v1/machines/$explicit" 2>/dev/null
+    "${CURL[@]}" -sf -X DELETE "$API_URL/api/v1/machines/$auto_name" 2>/dev/null
+    "${CURL[@]}" -sf -X DELETE "$API_URL/api/v1/machines/$explicit" 2>/dev/null
 }
 
 echo ""
@@ -305,7 +309,7 @@ run_test "API: auto-generated names" test_api_auto_generated_names || true
 test_trace_id_in_response_header() {
     # Every API response should have an X-Trace-Id header
     local headers
-    headers=$(curl -sI "$API_URL/health" 2>&1)
+    headers=$("${CURL[@]}" -sI "$API_URL/health" 2>&1)
     echo "$headers" | grep -qi "x-trace-id" || { echo "Missing X-Trace-Id header"; return 1; }
 
     # Trace ID should be a hex string
@@ -317,8 +321,8 @@ test_trace_id_in_response_header() {
 test_trace_id_unique_per_request() {
     # Two requests should get different trace IDs
     local tid1 tid2
-    tid1=$(curl -sI "$API_URL/health" 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
-    tid2=$(curl -sI "$API_URL/health" 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
+    tid1=$("${CURL[@]}" -sI "$API_URL/health" 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
+    tid2=$("${CURL[@]}" -sI "$API_URL/health" 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
 
     [[ -n "$tid1" ]] && [[ -n "$tid2" ]] && [[ "$tid1" != "$tid2" ]] || {
         echo "Trace IDs not unique: '$tid1' vs '$tid2'"
@@ -336,23 +340,23 @@ run_test "Trace ID: unique per request" test_trace_id_unique_per_request || true
 test_trace_id_end_to_end() {
     # Create and start a machine via API
     local vm_name="trace-e2e-test-$$"
-    curl -sf -X POST "$API_URL/api/v1/machines" \
+    "${CURL[@]}" -sf -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$vm_name\", \"cpus\": 1, \"memoryMb\": 512}" >/dev/null 2>&1 || return 1
-    curl -sf -X POST "$API_URL/api/v1/machines/$vm_name/start" >/dev/null 2>&1 || {
-        curl -sf -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null 2>&1
+    "${CURL[@]}" -sf -X POST "$API_URL/api/v1/machines/$vm_name/start" >/dev/null 2>&1 || {
+        "${CURL[@]}" -sf -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null 2>&1
         return 1
     }
 
     # Exec a command and capture the trace ID from the response header
     local trace_id
-    trace_id=$(curl -sD - -X POST "$API_URL/api/v1/machines/$vm_name/exec" \
+    trace_id=$("${CURL[@]}" -sD - -X POST "$API_URL/api/v1/machines/$vm_name/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["echo", "trace-e2e"]}' 2>&1 | grep -i "x-trace-id" | tr -d '\r' | awk '{print $2}')
 
     # Cleanup
-    curl -sf -X POST "$API_URL/api/v1/machines/$vm_name/stop" >/dev/null 2>&1
-    curl -sf -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null 2>&1
+    "${CURL[@]}" -sf -X POST "$API_URL/api/v1/machines/$vm_name/stop" >/dev/null 2>&1
+    "${CURL[@]}" -sf -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null 2>&1
 
     # Verify we got a trace ID back
     [[ -n "$trace_id" ]] || { echo "No trace ID returned from exec"; return 1; }
@@ -365,7 +369,7 @@ run_test "Trace ID: end-to-end with running VM" test_trace_id_end_to_end || true
 
 test_metrics_endpoint() {
     local response
-    response=$(curl -s "$API_URL/metrics" 2>&1)
+    response=$("${CURL[@]}" -s "$API_URL/metrics" 2>&1)
 
     # Should return Prometheus text format
     [[ -n "$response" ]] || { echo "Empty metrics response"; return 1; }
@@ -376,7 +380,7 @@ test_metrics_endpoint() {
 
 test_health_enriched() {
     local response
-    response=$(curl -s "$API_URL/health" 2>&1)
+    response=$("${CURL[@]}" -s "$API_URL/health" 2>&1)
 
     # Should have version
     echo "$response" | grep -q '"version"' || { echo "Missing version"; return 1; }
