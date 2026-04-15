@@ -1086,6 +1086,42 @@ test_port_conflict_across_vms() {
 
 run_test "Port: cross-VM conflict detected" test_port_conflict_across_vms || true
 
+# Regression: concurrent machine starts used to fail with "Database already
+# open. Cannot acquire lock." The fix retries with exponential backoff.
+test_concurrent_machine_start() {
+    local vm_a="conc-start-a-$$"
+    local vm_b="conc-start-b-$$"
+
+    $SMOLVM machine create "$vm_a" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
+    $SMOLVM machine create "$vm_b" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
+
+    # Start both simultaneously — previously the second would fail with DB lock error
+    $SMOLVM machine start --name "$vm_a" 2>&1 >/dev/null &
+    local pid_a=$!
+    $SMOLVM machine start --name "$vm_b" 2>&1 >/dev/null &
+    local pid_b=$!
+    wait $pid_a; local exit_a=$?
+    wait $pid_b; local exit_b=$?
+
+    # Both should succeed
+    [[ $exit_a -eq 0 ]] || { echo "FAIL: start a failed (exit $exit_a)"; }
+    [[ $exit_b -eq 0 ]] || { echo "FAIL: start b failed (exit $exit_b)"; }
+
+    # Both should be running
+    local status_a status_b
+    status_a=$($SMOLVM machine status --name "$vm_a" 2>&1)
+    status_b=$($SMOLVM machine status --name "$vm_b" 2>&1)
+
+    $SMOLVM machine stop --name "$vm_a" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_b" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_a" -f 2>/dev/null || true
+    $SMOLVM machine delete "$vm_b" -f 2>/dev/null || true
+
+    [[ "$status_a" == *"running"* ]] && [[ "$status_b" == *"running"* ]]
+}
+
+run_test "Concurrent machine starts" test_concurrent_machine_start || true
+
 echo ""
 echo "--- Machine Run (Ephemeral) Tests ---"
 echo ""

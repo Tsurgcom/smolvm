@@ -13,6 +13,32 @@ use redb::{Database, ReadableTable, TableDefinition, TableError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Maximum number of attempts to open the database when another process holds
+/// the lock. Each concurrent `smolvm` CLI invocation (e.g., parallel
+/// `machine start` calls) opens the database exclusively via redb's file lock.
+/// Without retry, the second process fails immediately with
+/// "Database already open. Cannot acquire lock."
+///
+/// With 10 retries and exponential backoff (50ms initial, 1s cap), the total
+/// wait before giving up is ~5 seconds — enough for any normal CLI operation
+/// to release the lock.
+const DB_OPEN_MAX_RETRIES: u32 = 10;
+
+/// Initial backoff delay between database open retries.
+/// Starts short (10ms) since typical DB operations complete in ~1-2ms.
+/// Doubles on each attempt: 10ms → 20ms → 40ms → 80ms → 160ms → 320ms → 640ms → 1000ms (capped).
+const DB_OPEN_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Maximum backoff delay between retries. Prevents excessive wait on any
+/// single retry when the backoff would otherwise grow beyond this.
+const DB_OPEN_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Check if a redb error indicates another process holds the database lock.
+fn is_lock_contention(e: &redb::DatabaseError) -> bool {
+    matches!(e, redb::DatabaseError::DatabaseAlreadyOpen)
+}
 
 /// Table for storing VM records (name -> JSON-serialized VmRecord).
 const VMS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vms");
@@ -56,15 +82,51 @@ impl std::fmt::Debug for SmolvmDb {
 
 impl SmolvmDb {
     /// Run a closure with the cached database handle, opening it on first use.
+    ///
+    /// If another process holds the database lock, retries with exponential
+    /// backoff rather than failing immediately. This allows concurrent CLI
+    /// commands (e.g., parallel `machine start` calls) to succeed.
     fn with_db<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Database) -> Result<T>,
     {
         let mut guard = self.handle.lock();
         if guard.is_none() {
-            *guard = Some(Database::create(&self.path).db_err("open database")?);
+            *guard = Some(Self::open_with_retry(&self.path)?);
         }
         f(guard.as_ref().unwrap())
+    }
+
+    /// Open the database file, retrying with exponential backoff on lock contention.
+    ///
+    /// redb uses an exclusive file lock — only one process can have the database
+    /// open at a time. When multiple CLI commands run concurrently (e.g., parallel
+    /// `machine start` calls), the second process retries until the first releases
+    /// the lock. The API server avoids this entirely by holding a single long-lived
+    /// database connection.
+    fn open_with_retry(path: &Path) -> Result<Database> {
+        let mut backoff = DB_OPEN_INITIAL_BACKOFF;
+        for attempt in 0..=DB_OPEN_MAX_RETRIES {
+            match Database::create(path) {
+                Ok(db) => return Ok(db),
+                Err(e) if attempt < DB_OPEN_MAX_RETRIES && is_lock_contention(&e) => {
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        max = DB_OPEN_MAX_RETRIES,
+                        backoff_ms = backoff.as_millis(),
+                        "database locked by another process, retrying"
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = std::cmp::min(backoff * 2, DB_OPEN_MAX_BACKOFF);
+                }
+                Err(e) => {
+                    return Err(Error::database_unavailable(format!("open database: {}", e)));
+                }
+            }
+        }
+        // All retries exhausted — the loop always returns on the last iteration
+        // (attempt == DB_OPEN_MAX_RETRIES falls through to the Err arm).
+        unreachable!()
     }
 
     /// Open the database at the default location.
