@@ -2154,6 +2154,9 @@ fn spawn_interactive_command(
         spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
     }
 
+    // Forward SSH agent into the container if enabled at boot.
+    ssh_agent::inject_into_container(&mut spec);
+
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -2240,6 +2243,9 @@ fn spawn_interactive_command(
     if workspace_src.exists() {
         spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
     }
+
+    // Forward SSH agent into the container if enabled at boot.
+    ssh_agent::inject_into_container(&mut spec);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;

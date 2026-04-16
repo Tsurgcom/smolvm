@@ -1853,6 +1853,9 @@ pub fn run_command(
             spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
         }
 
+        // Forward SSH agent into the container if enabled at boot.
+        crate::ssh_agent::inject_into_container(&mut spec);
+
         // Write config.json to bundle
         spec.write_to(&bundle_path)
             .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;

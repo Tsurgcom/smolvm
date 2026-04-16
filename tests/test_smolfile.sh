@@ -1177,6 +1177,63 @@ test_ssh_agent_fails_without_host_socket() {
     cleanup_vm "$vm_name"
 }
 
+# Regression test for SSH agent forwarding into container exec.
+#
+# Image-based machines route `machine exec` through crun — the container
+# has its own mount namespace and env, so forwarding that works for bare
+# VMs (direct exec inherits the agent's env) silently breaks unless we
+# both bind-mount the bridge socket and set SSH_AUTH_SOCK in the OCI spec.
+# This test catches regressions in either piece.
+test_ssh_agent_forwarded_to_container_exec() {
+    local vm_name="ssh-agent-container-$$"
+    cleanup_vm "$vm_name"
+
+    # Skip if no SSH agent on host (can't verify end-to-end key listing)
+    if ! ssh-add -l >/dev/null 2>&1; then
+        echo "  SKIP (no SSH keys loaded on host)"
+        return 0
+    fi
+
+    # Image-based machine: exec goes through crun container, not direct VM exec.
+    $SMOLVM machine create "$vm_name" --image alpine:latest --ssh-agent --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
+
+    # SSH_AUTH_SOCK must be set inside the container.
+    local result
+    result=$($SMOLVM machine exec --name "$vm_name" -- sh -c 'echo $SSH_AUTH_SOCK' 2>&1) || return 1
+    if [[ "$result" != *"/tmp/ssh-agent.sock"* ]]; then
+        echo "  FAIL: SSH_AUTH_SOCK not set in container: $result"
+        return 1
+    fi
+
+    # Socket file must be visible inside the container.
+    result=$($SMOLVM machine exec --name "$vm_name" -- ls /tmp/ssh-agent.sock 2>&1) || return 1
+    if [[ "$result" != *"ssh-agent.sock"* ]]; then
+        echo "  FAIL: bridge socket not mounted into container: $result"
+        return 1
+    fi
+
+    # End-to-end: inside the container, `ssh-add -l` should list the same
+    # keys as the host. This proves the bind mount carries real bytes, not
+    # a dangling file entry.
+    $SMOLVM machine exec --name "$vm_name" -- apk add openssh-client 2>/dev/null || true
+    $SMOLVM machine exec --name "$vm_name" -- which ssh-add 2>/dev/null || return 1
+
+    local guest_keys host_keys host_fp
+    guest_keys=$($SMOLVM machine exec --name "$vm_name" -- ssh-add -l 2>&1) || return 1
+    host_keys=$(ssh-add -l 2>&1)
+    host_fp=$(echo "$host_keys" | head -1 | awk '{print $2}')
+
+    if [[ "$guest_keys" != *"$host_fp"* ]]; then
+        echo "  FAIL: container ssh-add -l did not return host keys"
+        echo "  host: $host_keys"
+        echo "  container: $guest_keys"
+        return 1
+    fi
+
+    cleanup_vm "$vm_name"
+}
+
 echo ""
 echo "--- SSH Agent Forwarding Tests ---"
 echo ""
@@ -1186,6 +1243,7 @@ run_test "SSH agent: guest can list host keys" test_ssh_agent_lists_host_keys ||
 run_test "SSH agent: socket absent without flag" test_ssh_agent_not_present_without_flag || true
 run_test "SSH agent: Smolfile [auth] ssh_agent" test_ssh_agent_smolfile || true
 run_test "SSH agent: fails when SSH_AUTH_SOCK missing" test_ssh_agent_fails_without_host_socket || true
+run_test "SSH agent: forwarded into container exec (image-based VM)" test_ssh_agent_forwarded_to_container_exec || true
 
 # =============================================================================
 # [network] section — egress policy via Smolfile

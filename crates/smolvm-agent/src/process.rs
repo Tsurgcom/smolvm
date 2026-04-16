@@ -312,6 +312,7 @@ mod tests {
                 assert!(output.stdout.contains("hello"));
             }
             WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+            WaitResult::ClientDisconnected { .. } => panic!("unexpected client disconnect"),
         }
     }
 
@@ -331,6 +332,7 @@ mod tests {
                 assert_eq!(exit_code, 42);
             }
             WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+            WaitResult::ClientDisconnected { .. } => panic!("unexpected client disconnect"),
         }
     }
 
@@ -352,6 +354,7 @@ mod tests {
                 assert!(output.stdout.contains("quick"));
             }
             WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+            WaitResult::ClientDisconnected { .. } => panic!("unexpected client disconnect"),
         }
     }
 
@@ -371,6 +374,7 @@ mod tests {
                 assert_eq!(timeout_ms, 50);
             }
             WaitResult::Completed { .. } => panic!("expected timeout"),
+            WaitResult::ClientDisconnected { .. } => panic!("unexpected client disconnect"),
         }
     }
 

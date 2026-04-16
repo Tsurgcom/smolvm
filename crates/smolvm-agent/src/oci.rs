@@ -274,6 +274,18 @@ impl OciSpec {
         });
     }
 
+    /// Set or replace an environment variable on the container's process.
+    ///
+    /// If an entry with the same key already exists (e.g., inherited from
+    /// the image config), it is replaced — otherwise appended. This avoids
+    /// the container seeing two entries for the same variable, which would
+    /// leave the value shell-dependent.
+    pub fn add_env(&mut self, name: &str, value: &str) {
+        let prefix = format!("{}=", name);
+        self.process.env.retain(|entry| !entry.starts_with(&prefix));
+        self.process.env.push(format!("{}{}", prefix, value));
+    }
+
     /// Write the OCI spec to a config.json file in the bundle directory.
     pub fn write_to(&self, bundle_dir: &Path) -> std::io::Result<()> {
         let config_path = bundle_dir.join("config.json");
