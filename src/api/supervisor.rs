@@ -191,16 +191,12 @@ impl Supervisor {
     }
 
     /// Get the console log path for a machine.
+    ///
+    /// Resolves to the VM's hash-derived data directory — the canonical
+    /// layout used by `AgentManager::new_internal` and exposed via
+    /// `vm_data_dir` / the `machine data-dir` CLI command.
     fn get_machine_log_path(&self, name: &str) -> Option<std::path::PathBuf> {
-        let runtime_dir = dirs::runtime_dir()
-            .or_else(dirs::cache_dir)
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        let log_path = runtime_dir
-            .join("smolvm")
-            .join("vms")
-            .join(name)
-            .join("agent-console.log");
-
+        let log_path = crate::agent::vm_data_dir(name).join("agent-console.log");
         if log_path.exists() {
             Some(log_path)
         } else {

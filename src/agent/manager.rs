@@ -332,16 +332,23 @@ impl AgentManager {
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
     ) -> Result<Self> {
-        // Create runtime directory for sockets
-        let runtime_dir = dirs::runtime_dir()
-            .or_else(dirs::cache_dir)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-
-        // Named VMs get their own subdirectory
+        // Named VMs colocate runtime artifacts (sockets, logs, pid, config) in
+        // their hash-derived data directory — matching where `storage_disk`
+        // lives via `ensure_vm_dir` and what `vm_data_dir` / `machine data-dir`
+        // report. Using the hash path bounds socket paths under the
+        // `sockaddr_un.sun_path` budget (104 bytes macOS / 108 Linux) for any
+        // VM name length.
+        //
+        // Unnamed VMs (ephemeral) don't have a data dir, so they fall back to
+        // the platform runtime dir (`/run/user/<uid>/smolvm` on Linux,
+        // `~/Library/Caches/smolvm` on macOS) — shared across ephemeral runs.
         let smolvm_runtime = if let Some(ref vm_name) = name {
-            runtime_dir.join("smolvm").join("vms").join(vm_name)
+            vm_data_dir(vm_name)
         } else {
-            runtime_dir.join("smolvm")
+            dirs::runtime_dir()
+                .or_else(dirs::cache_dir)
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("smolvm")
         };
         std::fs::create_dir_all(&smolvm_runtime)?;
 
