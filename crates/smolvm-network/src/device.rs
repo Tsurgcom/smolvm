@@ -3,8 +3,7 @@
 //! Context
 //! =======
 //!
-//! smoltcp does not know anything about libkrun, Unix streams, or our queue
-//! objects. It expects to talk to an implementation of its `phy::Device` trait:
+//! smoltcp talks to an implementation of its `phy::Device` trait:
 //! - `receive()` yields one incoming frame and a transmit token
 //! - `transmit()` yields a transmit token when space exists for an outgoing
 //!   frame
@@ -38,7 +37,7 @@
 //!   -> poll loop later wakes frame writer
 //! ```
 
-use crate::network::virtio::queues::NetworkFrameQueues;
+use crate::queues::NetworkFrameQueues;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};

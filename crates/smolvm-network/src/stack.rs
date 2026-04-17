@@ -49,11 +49,10 @@
 //! smoltcp emitted frames  -> host_wake   -> frame writer
 //! ```
 
-use crate::data::network::DEFAULT_DNS_ADDR;
-use crate::network::virtio::device::VirtioNetworkDevice;
-use crate::network::virtio::queues::NetworkFrameQueues;
-use crate::network::virtio::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
-use crate::network::virtio::virtio_net_log;
+use crate::device::VirtioNetworkDevice;
+use crate::queues::NetworkFrameQueues;
+use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
+use crate::{virtio_net_log, DEFAULT_DNS_ADDR};
 use smoltcp::iface::{
     Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
 };

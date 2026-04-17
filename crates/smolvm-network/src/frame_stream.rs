@@ -38,7 +38,7 @@
 //!   <-> VirtioNetworkDevice / smoltcp poll loop
 //! ```
 
-use crate::network::virtio::queues::NetworkFrameQueues;
+use crate::queues::NetworkFrameQueues;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};

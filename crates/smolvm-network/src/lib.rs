@@ -45,21 +45,11 @@
 //! - poll thread: acts as the guest-visible gateway and protocol dispatcher
 //! - `TcpRelayTable`: maps guest TCP flows onto host-side relay threads
 //!
-//! In Phase 1 this runtime is responsible for:
+//! This runtime is responsible for:
 //! - exchanging raw Ethernet frames with libkrun
 //! - presenting a gateway endpoint to the guest
 //! - handling DNS through a gateway UDP socket and host UDP forwarding
 //! - relaying guest TCP connections to host `TcpStream`s
-//!
-//! What is *not* here yet:
-//! - launcher wiring and `krun_add_net_unixstream()` setup
-//! - port publishing
-//! - non-DNS UDP relay
-//! - policy enforcement / DNS filtering
-//! - TLS MITM or deeper packet rewriting
-//!
-//! So this module is the host data plane, but not yet the full user-visible
-//! networking feature.
 
 pub mod device;
 pub mod frame_stream;
@@ -67,15 +57,54 @@ pub mod queues;
 pub mod stack;
 pub mod tcp_relay;
 
-use crate::network::addressing::GuestNetworkConfig;
-use crate::network::virtio::frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
-use crate::network::virtio::queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
-use crate::network::virtio::stack::{start_network_stack, VirtioPollConfig};
 use std::fmt;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::RawFd;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
+
+use frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
+use queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
+use stack::{start_network_stack, VirtioPollConfig};
+
+/// Default upstream DNS resolver used by the gateway runtime.
+pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+/// Static guest network configuration for the virtio-net MVP.
+///
+/// This struct describes the two endpoints of the single virtual Ethernet link:
+/// - the guest NIC (`guest_*`)
+/// - the host-side gateway implemented by smolvm (`gateway_*`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestNetworkConfig {
+    /// Guest IPv4 address.
+    pub guest_ip: Ipv4Addr,
+    /// Gateway IPv4 address.
+    pub gateway_ip: Ipv4Addr,
+    /// Prefix length.
+    pub prefix_len: u8,
+    /// Guest MAC address.
+    pub guest_mac: [u8; 6],
+    /// Gateway MAC address.
+    pub gateway_mac: [u8; 6],
+    /// DNS server address presented to the guest.
+    pub dns_server: Ipv4Addr,
+}
+
+impl GuestNetworkConfig {
+    /// Default Phase 1 guest network configuration.
+    pub const fn default() -> Self {
+        Self {
+            guest_ip: Ipv4Addr::new(100, 96, 0, 2),
+            gateway_ip: Ipv4Addr::new(100, 96, 0, 1),
+            prefix_len: 30,
+            guest_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x02],
+            gateway_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x01],
+            dns_server: Ipv4Addr::new(100, 96, 0, 1),
+        }
+    }
+}
 
 fn format_network_log_line(timestamp: SystemTime, message: &str) -> String {
     format!(
@@ -94,7 +123,7 @@ pub(crate) fn emit_network_log_line(message: fmt::Arguments<'_>) {
 
 macro_rules! virtio_net_log {
     ($($arg:tt)*) => {
-        $crate::network::virtio::emit_network_log_line(format_args!($($arg)*))
+        $crate::emit_network_log_line(format_args!($($arg)*))
     };
 }
 

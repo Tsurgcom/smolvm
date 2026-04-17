@@ -26,8 +26,8 @@
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
 
-use crate::network::virtio::queues::WakePipe;
-use crate::network::virtio::virtio_net_log;
+use crate::queues::WakePipe;
+use crate::virtio_net_log;
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpListenEndpoint;
