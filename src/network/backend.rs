@@ -1,24 +1,7 @@
 use clap::ValueEnum;
 
-/// virtio-net checksum offload feature bit.
-pub const NET_FEATURE_CSUM: u32 = 1 << 0;
-/// virtio-net guest checksum offload feature bit.
-pub const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
-/// virtio-net guest TCP segmentation offload for IPv4.
-pub const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
-/// virtio-net guest UDP fragmentation offload.
-pub const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
-/// virtio-net host TCP segmentation offload for IPv4.
-pub const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
-/// virtio-net host UDP fragmentation offload.
-pub const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
 /// libkrun's compatibility feature set for unixstream-backed virtio-net.
-pub const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
-    | NET_FEATURE_GUEST_CSUM
-    | NET_FEATURE_GUEST_TSO4
-    | NET_FEATURE_GUEST_UFO
-    | NET_FEATURE_HOST_TSO4
-    | NET_FEATURE_HOST_UFO;
+pub const COMPAT_NET_FEATURES: u32 = 0;
 
 /// Network backend override for machine launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ValueEnum)]

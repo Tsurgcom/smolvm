@@ -13,8 +13,8 @@
 //!
 //! The host responds with the same framing.
 
-use smolvm_protocol::ports;
 use smolvm_network::guest_env;
+use smolvm_protocol::ports;
 use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::thread;

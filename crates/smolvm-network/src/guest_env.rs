@@ -11,8 +11,6 @@
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";
 /// Canonical backend value meaning "configure guest virtio-net".
 pub const BACKEND_VIRTIO_NET: &str = "virtio-net";
-/// Legacy backend value retained for backwards compatibility.
-pub const BACKEND_VIRTIO_LEGACY: &str = "virtio";
 /// Guest IPv4 address.
 pub const GUEST_IP: &str = "SMOLVM_NETWORK_GUEST_IP";
 /// Guest-visible default gateway IPv4 address.

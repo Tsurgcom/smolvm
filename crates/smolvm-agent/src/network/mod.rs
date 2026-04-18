@@ -98,7 +98,7 @@ pub fn configure_from_env() -> Result<bool, String> {
         _ => return Ok(false),
     };
 
-    if backend != guest_env::BACKEND_VIRTIO_NET && backend != guest_env::BACKEND_VIRTIO_LEGACY {
+    if backend != guest_env::BACKEND_VIRTIO_NET {
         return Err(format!(
             "unsupported {} value: {}",
             guest_env::BACKEND,
