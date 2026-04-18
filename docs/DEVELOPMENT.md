@@ -25,7 +25,7 @@ cargo make dev
 
 # Run smolvm with environment variables set up automatically
 cargo make smolvm --version
-cargo make smolvm sandbox run --net --image alpine:latest -- echo hello
+cargo make smolvm machine run --net --image alpine:latest -- echo hello
 cargo make smolvm machine ls
 
 # Or run the binary directly with environment variables:
