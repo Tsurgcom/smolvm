@@ -66,11 +66,13 @@ pub fn validate_vm_name(name: &str, label: &str) -> Result<(), String> {
     }
 
     if !first_char.is_ascii_alphanumeric() {
-        return Err(format!("{label} must start with a letter or digit"));
+        return Err(format!(
+            "{label} must start with a letter or digit (got: {name:?})"
+        ));
     }
 
     if name.ends_with('-') {
-        return Err(format!("{label} cannot end with a hyphen"));
+        return Err(format!("{label} cannot end with a hyphen (got: {name:?})"));
     }
 
     let mut prev_was_hyphen = false;

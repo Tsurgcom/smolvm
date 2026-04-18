@@ -132,6 +132,62 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+fn resolve_cache_asset_path(
+    cache_dir: &Path,
+    asset_rel_path: &str,
+    context: &str,
+) -> std::io::Result<PathBuf> {
+    if asset_rel_path.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} path is empty", context),
+        ));
+    }
+
+    let rel = Path::new(asset_rel_path);
+    if rel.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} path must be relative", context),
+        ));
+    }
+
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            std::path::Component::ParentDir
+            | std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} path contains disallowed components", context),
+                ));
+            }
+        }
+    }
+
+    let cache_root = cache_dir
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path(cache_dir));
+    let candidate = cache_dir.join(rel);
+
+    let resolved = if candidate.exists() {
+        candidate.canonicalize()?
+    } else {
+        normalize_path(&candidate)
+    };
+
+    if !resolved.starts_with(&cache_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} path escapes cache directory", context),
+        ));
+    }
+
+    Ok(resolved)
+}
+
 /// Marker file indicating extraction is complete.
 const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 
@@ -1035,7 +1091,7 @@ pub fn copy_overlay_template(
         )
     })?;
 
-    let src = cache_dir.join(template);
+    let src = resolve_cache_asset_path(cache_dir, template, "overlay template")?;
     if !src.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1072,7 +1128,7 @@ pub fn create_or_copy_storage_disk(
     size_gb_override: Option<u64>,
 ) -> std::io::Result<()> {
     if let Some(template) = template_path {
-        let template_path = cache_dir.join(template);
+        let template_path = resolve_cache_asset_path(cache_dir, template, "storage template")?;
         if template_path.exists() {
             fs::copy(&template_path, storage_path)?;
             // If a custom size was requested and it's larger than the template,
@@ -1207,6 +1263,41 @@ mod tests {
         // We can't test GiB-sized files, but we can verify the copy works
         copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest2, None).unwrap();
         assert!(dest2.exists());
+    }
+
+    #[test]
+    fn test_copy_overlay_template_rejects_traversal_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = temp_dir.path().join("outside.raw");
+        let dest = temp_dir.path().join("overlay.raw");
+        fs::write(&outside, b"x").unwrap();
+
+        let result = copy_overlay_template(temp_dir.path(), Some("../outside.raw"), &dest, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_or_copy_storage_disk_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("storage-template.ext4");
+        fs::write(&outside_file, b"template").unwrap();
+
+        symlink(outside_dir.path(), temp_dir.path().join("symlink-out")).unwrap();
+
+        let storage_path = temp_dir.path().join("storage.ext4");
+        let result = create_or_copy_storage_disk(
+            temp_dir.path(),
+            Some("symlink-out/storage-template.ext4"),
+            &storage_path,
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

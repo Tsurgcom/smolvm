@@ -175,10 +175,15 @@ impl PackCreateCmd {
         let staging_dir = temp_dir.path().join("staging");
 
         // Start a temporary agent VM with a unique identity so concurrent
-        // pack runs and the user's "default" VM don't collide.
+        // pack runs and the user's "default" VM don't collide. The prefix
+        // must start with an ascii-alphanumeric character to satisfy
+        // `validate_vm_name` when `AgentManager::for_vm` receives the name
+        // (see src/data/mod.rs). A leading underscore — the previous
+        // `__pack_` convention — was rejected outright and made every
+        // `smolvm pack create` invocation fail.
         // Use PID + epoch nanos to avoid PID-reuse collisions with orphaned VMs.
         let pack_vm_name = format!(
-            "__pack_{}_{}",
+            "pack-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -485,8 +490,10 @@ impl PackCreateCmd {
             // Start temp VM with source VM's storage disk attached as an extra
             // virtio-blk device. virtiofs can only share directories, not files,
             // so we pass the ext4 disk image as a third block device (/dev/vdc).
+            // Same alphanumeric-first-char constraint as the image-pack
+            // path above; see the comment there for rationale.
             let pack_vm_name = format!(
-                "__pack_fromvm_{}_{}",
+                "pack-fromvm-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

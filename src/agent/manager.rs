@@ -3,6 +3,7 @@
 //! The AgentManager is responsible for starting and stopping the agent VM,
 //! which runs the smolvm-agent for OCI image management and command execution.
 
+use crate::data::validate_vm_name;
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
@@ -332,6 +333,11 @@ impl AgentManager {
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
     ) -> Result<Self> {
+        if let Some(ref vm_name) = name {
+            validate_vm_name(vm_name, "machine name")
+                .map_err(|e| Error::config("validate machine name", e))?;
+        }
+
         // Named VMs colocate runtime artifacts (sockets, logs, pid, config) in
         // their hash-derived data directory — matching where `storage_disk`
         // lives via `ensure_vm_dir` and what `vm_data_dir` / `machine data-dir`

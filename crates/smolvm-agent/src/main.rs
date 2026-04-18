@@ -184,18 +184,6 @@ fn main() {
     // before this point, ensure_storage_mounted() handles the mount on demand.
     ensure_storage_mounted();
 
-    // Create /workspace symlink for bare VMs. Image-based VMs get /workspace
-    // via a bind mount in the container spec, but bare VMs run directly in the
-    // VM rootfs where /workspace doesn't exist. The symlink makes /workspace
-    // available in both modes.
-    {
-        let workspace_link = std::path::Path::new("/workspace");
-        let workspace_target = std::path::Path::new("/storage/workspace");
-        if !workspace_link.exists() && workspace_target.exists() {
-            let _ = std::os::unix::fs::symlink(workspace_target, workspace_link);
-        }
-    }
-
     // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
     let t0 = uptime_ms();
     if let Some(packed_dir) = storage::get_packed_layers_dir() {
@@ -206,7 +194,10 @@ fn main() {
         );
     }
 
-    // Initialize volume mounts from SMOLVM_MOUNT_* env vars
+    // Initialize volume mounts from SMOLVM_MOUNT_* env vars.
+    // MUST run before the /workspace symlink below — if the user passed
+    // `-v host:/workspace`, the bind mount claims /workspace first and
+    // the symlink's `!exists()` guard correctly skips creation.
     let t0 = uptime_ms();
     let boot_mounts = storage::init_volume_mounts();
     if !boot_mounts.is_empty() {
@@ -215,6 +206,20 @@ fn main() {
             mount_count = boot_mounts.len(),
             "volume mounts initialized at boot"
         );
+    }
+
+    // Create /workspace symlink for bare VMs (no -v targeting /workspace).
+    // Image-based VMs get /workspace via a bind mount in the container spec,
+    // but bare VMs run directly in the VM rootfs where /workspace doesn't
+    // exist. The symlink makes /workspace available in both modes.
+    // Placed AFTER init_volume_mounts so that `-v host:/workspace` takes
+    // priority — the exists() check sees the bind mount and skips.
+    {
+        let workspace_link = std::path::Path::new("/workspace");
+        let workspace_target = std::path::Path::new("/storage/workspace");
+        if !workspace_link.exists() && workspace_target.exists() {
+            let _ = std::os::unix::fs::symlink(workspace_target, workspace_link);
+        }
     }
 
     // Registry load+reconcile deferred to first container operation via
@@ -1568,55 +1573,207 @@ fn apply_mode_best_effort(path: &std::path::Path, mode: u32) {
 #[cfg(not(unix))]
 fn apply_mode_best_effort(_path: &std::path::Path, _mode: u32) {}
 
-/// Resolve a guest path through the active persistent container overlay.
-///
-/// When an image-based VM has a mounted persistent overlay, file I/O
-/// paths (from `machine cp`) target the overlay's merged directory so
-/// files are visible inside the container. The host ensures the overlay
-/// is mounted before sending file I/O requests (via `PrepareOverlay`).
-///
-/// Returns the path unchanged for bare VMs (no overlay) or paths that
-/// target the VM's internal directories (`/storage/...`).
-fn resolve_container_path(path: &str) -> std::path::PathBuf {
-    // Don't redirect VM-internal paths.
-    if path.starts_with("/storage/") || path.starts_with("/proc/") || path.starts_with("/sys/") {
-        return std::path::PathBuf::from(path);
+#[derive(Clone, Copy, Debug)]
+enum FilePathAccess {
+    Read,
+    Write,
+}
+
+fn invalid_guest_path_error(path: &str, reason: &str) -> AgentResponse {
+    AgentResponse::error(
+        format!("invalid guest path {}: {}", path, reason),
+        error_codes::INVALID_REQUEST,
+    )
+}
+
+fn normalize_guest_path(path: &str) -> std::result::Result<String, AgentResponse> {
+    if path.is_empty() {
+        return Err(invalid_guest_path_error(path, "path is empty"));
     }
 
-    // /workspace is bind-mounted from /storage/workspace into the container.
-    // Rewrite so the agent writes to the bind-mount source.
-    if let Some(relative) =
-        path.strip_prefix("/workspace/").or_else(
-            || {
-                if path == "/workspace" {
-                    Some("")
-                } else {
-                    None
-                }
-            },
-        )
-    {
-        return std::path::PathBuf::from("/storage/workspace").join(relative);
-    }
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    };
 
-    let overlays_dir = std::path::Path::new("/storage/overlays");
-    if let Ok(entries) = std::fs::read_dir(overlays_dir) {
-        for entry in entries.flatten() {
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("persistent-")
-            {
-                continue;
+    let p = std::path::Path::new(&normalized);
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(invalid_guest_path_error(
+                    path,
+                    "parent traversal is not allowed",
+                ));
             }
-            let merged = entry.path().join("merged");
-            if merged.join("bin").exists() || merged.join("usr").exists() {
-                let relative = path.strip_prefix('/').unwrap_or(path);
-                return merged.join(relative);
+            std::path::Component::CurDir => {
+                return Err(invalid_guest_path_error(
+                    path,
+                    "current-dir segments are not allowed",
+                ));
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(invalid_guest_path_error(
+                    path,
+                    "path prefixes are not allowed",
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Normal(_) => {}
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn active_persistent_overlay_merged_root() -> Option<std::path::PathBuf> {
+    let overlays_dir = std::path::Path::new("/storage/overlays");
+    let entries = std::fs::read_dir(overlays_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("persistent-")
+        {
+            continue;
+        }
+        let merged = entry.path().join("merged");
+        if merged.join("bin").exists() || merged.join("usr").exists() {
+            return Some(merged);
+        }
+    }
+    None
+}
+
+fn ensure_descendant_after_canonicalize(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    original_path: &str,
+    access: FilePathAccess,
+) -> std::result::Result<(), AgentResponse> {
+    if matches!(access, FilePathAccess::Write) && !root.exists() {
+        std::fs::create_dir_all(root).map_err(|e| {
+            AgentResponse::error(
+                format!("failed to create root {}: {}", root.display(), e),
+                error_codes::FILE_IO_FAILED,
+            )
+        })?;
+    }
+
+    let root_canon = root.canonicalize().map_err(|e| {
+        AgentResponse::error(
+            format!("failed to canonicalize root {}: {}", root.display(), e),
+            error_codes::FILE_IO_FAILED,
+        )
+    })?;
+
+    match access {
+        FilePathAccess::Read => {
+            let path_canon = path.canonicalize().map_err(|e| {
+                AgentResponse::error(
+                    format!("failed to canonicalize target {}: {}", original_path, e),
+                    error_codes::FILE_IO_FAILED,
+                )
+            })?;
+            if !path_canon.starts_with(&root_canon) {
+                return Err(invalid_guest_path_error(
+                    original_path,
+                    "resolved path escapes allowed root",
+                ));
+            }
+        }
+        FilePathAccess::Write => {
+            let parent = path.parent().ok_or_else(|| {
+                invalid_guest_path_error(original_path, "target has no parent directory")
+            })?;
+
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AgentResponse::error(
+                    format!("failed to create directory {}: {}", parent.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                )
+            })?;
+
+            let parent_canon = parent.canonicalize().map_err(|e| {
+                AgentResponse::error(
+                    format!("failed to canonicalize parent {}: {}", parent.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                )
+            })?;
+            if !parent_canon.starts_with(&root_canon) {
+                return Err(invalid_guest_path_error(
+                    original_path,
+                    "resolved parent escapes allowed root",
+                ));
+            }
+
+            if path.exists() {
+                let path_canon = path.canonicalize().map_err(|e| {
+                    AgentResponse::error(
+                        format!("failed to canonicalize target {}: {}", original_path, e),
+                        error_codes::FILE_IO_FAILED,
+                    )
+                })?;
+                if !path_canon.starts_with(&root_canon) {
+                    return Err(invalid_guest_path_error(
+                        original_path,
+                        "resolved path escapes allowed root",
+                    ));
+                }
             }
         }
     }
-    std::path::PathBuf::from(path)
+
+    Ok(())
+}
+
+fn resolve_guest_io_path_with_roots(
+    path: &str,
+    access: FilePathAccess,
+    overlay_merged_root: Option<&std::path::Path>,
+    workspace_root: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, AgentResponse> {
+    let normalized = normalize_guest_path(path)?;
+
+    let Some(overlay_root) = overlay_merged_root else {
+        return Ok(std::path::PathBuf::from(normalized));
+    };
+
+    let (target, allowed_root): (std::path::PathBuf, &std::path::Path) = if let Some(relative) =
+        normalized.strip_prefix("/workspace/").or_else(|| {
+            if normalized == "/workspace" {
+                Some("")
+            } else {
+                None
+            }
+        }) {
+        (workspace_root.join(relative), workspace_root)
+    } else {
+        let relative = normalized.strip_prefix('/').unwrap_or(&normalized);
+        (overlay_root.join(relative), overlay_root)
+    };
+
+    ensure_descendant_after_canonicalize(&target, allowed_root, &normalized, access)?;
+    Ok(target)
+}
+
+/// Resolve guest file I/O path with strict boundary checks.
+///
+/// For image-based persistent VMs, paths are mapped into the active
+/// `persistent-*` overlay's `merged` root (except `/workspace`, which
+/// maps to `/storage/workspace`, the bind-mount source). Both read and
+/// write flows enforce canonicalized descendant checks against the
+/// selected root to prevent traversal and symlink escapes.
+fn resolve_guest_io_path(
+    path: &str,
+    access: FilePathAccess,
+) -> std::result::Result<std::path::PathBuf, AgentResponse> {
+    let overlay = active_persistent_overlay_merged_root();
+    resolve_guest_io_path_with_roots(
+        path,
+        access,
+        overlay.as_deref(),
+        std::path::Path::new("/storage/workspace"),
+    )
 }
 
 /// Shared between single-shot [`handle_file_write`] and the streaming
@@ -1624,7 +1781,10 @@ fn resolve_container_path(path: &str) -> std::path::PathBuf {
 /// need to guarantee: partial contents never appear at `path` under
 /// any error or kill scenario.
 fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
-    let resolved = resolve_container_path(path);
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Write) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let target = resolved.as_path();
     if let Err(resp) = ensure_parent_dir(target) {
         return resp;
@@ -1840,7 +2000,10 @@ fn handle_file_write_begin(
             ),
         );
     }
-    let resolved = resolve_container_path(&path);
+    let resolved = match resolve_guest_io_path(&path, FilePathAccess::Write) {
+        Ok(p) => p,
+        Err(resp) => return (None, resp),
+    };
     match WriteSession::open(resolved, mode, total_size) {
         Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
         Err(e) => (
@@ -1959,7 +2122,13 @@ fn handle_streaming_file_read(
     stream: &mut impl ReadWrite,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resolved = resolve_container_path(path);
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
+        Ok(p) => p,
+        Err(resp) => {
+            send_response(stream, &resp)?;
+            return Ok(());
+        }
+    };
     let mut file = match std::fs::File::open(&resolved) {
         Ok(f) => f,
         Err(e) => {
@@ -3924,6 +4093,112 @@ mod tests {
         );
         assert_eq!(std::fs::read(&target).unwrap(), payload);
         assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn resolve_guest_path_rejects_parent_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/../../storage/secret.txt",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_read_rejects_symlink_escape_from_overlay() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, b"secret").unwrap();
+        symlink(&outside_file, merged.join("link-outside")).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/link-outside",
+            FilePathAccess::Read,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_write_rejects_symlink_escape_from_overlay() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        symlink(&outside, merged.join("escape-dir")).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/escape-dir/pwned.txt",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    #[test]
+    fn resolve_guest_workspace_path_maps_to_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let resolved = resolve_guest_io_path_with_roots(
+            "/workspace/subdir/file.txt",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        )
+        .unwrap();
+
+        assert!(resolved.starts_with(&workspace));
+        assert_eq!(resolved, workspace.join("subdir").join("file.txt"));
+    }
+
+    #[test]
+    fn resolve_guest_relative_path_is_normalized_under_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let resolved = resolve_guest_io_path_with_roots(
+            "etc/hosts",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, merged.join("etc").join("hosts"));
     }
 
     #[test]

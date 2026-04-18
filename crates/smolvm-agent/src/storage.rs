@@ -28,6 +28,187 @@ const MANIFESTS_DIR: &str = "manifests";
 const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
 
+fn validate_storage_id(value: &str, context: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(StorageError::ValidationFailed {
+            context: context.to_string(),
+            reason: "cannot be empty".to_string(),
+        });
+    }
+
+    if value.len() > 128 {
+        return Err(StorageError::ValidationFailed {
+            context: context.to_string(),
+            reason: "too long (max 128 chars)".to_string(),
+        });
+    }
+
+    let path = Path::new(value);
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(StorageError::ValidationFailed {
+                    context: context.to_string(),
+                    reason: "parent traversal is not allowed".to_string(),
+                });
+            }
+            std::path::Component::CurDir => {
+                return Err(StorageError::ValidationFailed {
+                    context: context.to_string(),
+                    reason: "dot segments are not allowed".to_string(),
+                });
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(StorageError::ValidationFailed {
+                    context: context.to_string(),
+                    reason: "path separators are not allowed".to_string(),
+                });
+            }
+            std::path::Component::Normal(seg) => {
+                let seg = seg.to_string_lossy();
+                if !seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                {
+                    return Err(StorageError::ValidationFailed {
+                        context: context.to_string(),
+                        reason: format!("contains invalid character(s): {}", value),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn overlay_root_for_workload(workload_id: &str) -> Result<PathBuf> {
+    validate_storage_id(workload_id, "workload_id")?;
+    Ok(Path::new(STORAGE_ROOT).join(OVERLAYS_DIR).join(workload_id))
+}
+
+fn validate_container_destination_path(container_path: &str) -> Result<PathBuf> {
+    if !container_path.starts_with('/') {
+        return Err(StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "must be an absolute path".to_string(),
+        });
+    }
+    if container_path == "/" {
+        return Err(StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "mounting to '/' is not allowed".to_string(),
+        });
+    }
+
+    let mut relative = PathBuf::new();
+    for component in Path::new(container_path).components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(seg) => relative.push(seg),
+            std::path::Component::ParentDir => {
+                return Err(StorageError::ValidationFailed {
+                    context: "mount destination".to_string(),
+                    reason: "parent traversal is not allowed".to_string(),
+                });
+            }
+            std::path::Component::CurDir => {
+                return Err(StorageError::ValidationFailed {
+                    context: "mount destination".to_string(),
+                    reason: "dot segments are not allowed".to_string(),
+                });
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(StorageError::ValidationFailed {
+                    context: "mount destination".to_string(),
+                    reason: "path prefixes are not allowed".to_string(),
+                });
+            }
+        }
+    }
+
+    if relative.as_os_str().is_empty() {
+        return Err(StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "cannot resolve mount destination".to_string(),
+        });
+    }
+
+    Ok(relative)
+}
+
+fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result<PathBuf> {
+    let root_canon = rootfs.canonicalize().map_err(|e| StorageError::ReadFile {
+        path: rootfs.display().to_string(),
+        cause: format!("failed to canonicalize rootfs: {}", e),
+    })?;
+
+    let relative = validate_container_destination_path(container_path)?;
+    let mut current = root_canon.clone();
+
+    for component in relative.components() {
+        let std::path::Component::Normal(seg) = component else {
+            return Err(StorageError::ValidationFailed {
+                context: "mount destination".to_string(),
+                reason: "invalid destination component".to_string(),
+            });
+        };
+
+        current.push(seg);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    let canon = current.canonicalize().map_err(|e| StorageError::ReadFile {
+                        path: current.display().to_string(),
+                        cause: format!("failed to canonicalize symlink target: {}", e),
+                    })?;
+                    if !canon.starts_with(&root_canon) {
+                        return Err(StorageError::ValidationFailed {
+                            context: "mount destination".to_string(),
+                            reason: "resolved path escapes rootfs".to_string(),
+                        });
+                    }
+                }
+
+                if !meta.is_dir() {
+                    return Err(StorageError::ValidationFailed {
+                        context: "mount destination".to_string(),
+                        reason: format!(
+                            "destination component is not a directory: {}",
+                            current.display()
+                        ),
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|err| StorageError::CreateDir {
+                    path: current.display().to_string(),
+                    cause: err.to_string(),
+                })?;
+            }
+            Err(e) => {
+                return Err(StorageError::ReadFile {
+                    path: current.display().to_string(),
+                    cause: e.to_string(),
+                });
+            }
+        }
+    }
+
+    let final_canon = current.canonicalize().map_err(|e| StorageError::ReadFile {
+        path: current.display().to_string(),
+        cause: format!("failed to canonicalize mount destination: {}", e),
+    })?;
+    if !final_canon.starts_with(&root_canon) {
+        return Err(StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "resolved path escapes rootfs".to_string(),
+        });
+    }
+
+    Ok(final_canon)
+}
+
 /// Global state for packed layers support.
 /// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
 static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -156,7 +337,7 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
         // Mount using existing logic with empty rootfs prefix so bind mounts
         // go to absolute guest paths (e.g., "/data"), visible to VmExec.
         if !mounts.is_empty() {
-            if let Err(e) = setup_volume_mounts("", &mounts) {
+            if let Err(e) = setup_volume_mounts("/", &mounts) {
                 warn!(error = %e, "failed to setup boot volume mounts");
             }
         }
@@ -1345,16 +1526,15 @@ struct OverlaySetup {
 
 impl OverlaySetup {
     /// Create a new overlay setup for the given workload.
-    fn new(workload_id: &str) -> Self {
-        let root = Path::new(STORAGE_ROOT);
-        let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
-        Self {
+    fn new(workload_id: &str) -> Result<Self> {
+        let overlay_root = overlay_root_for_workload(workload_id)?;
+        Ok(Self {
             upper_path: overlay_root.join("upper"),
             work_path: overlay_root.join("work"),
             merged_path: overlay_root.join("merged"),
             overlay_root,
             workload_id: workload_id.to_string(),
-        }
+        })
     }
 
     /// Prepare overlay directories, cleaning up any previous state.
@@ -1584,7 +1764,7 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
         })
         .collect();
 
-    OverlaySetup::new(workload_id).execute_or_remount(lowerdirs)
+    OverlaySetup::new(workload_id)?.execute_or_remount(lowerdirs)
 }
 
 /// Prepare an overlay filesystem using pre-packed layers.
@@ -1641,7 +1821,7 @@ fn prepare_overlay_from_packed(
         .collect();
 
     // Use shared overlay setup logic
-    OverlaySetup::new(workload_id).execute(lowerdirs)
+    OverlaySetup::new(workload_id)?.execute(lowerdirs)
 }
 
 /// Build lowerdir list from a pulled OCI image's layers.
@@ -1697,8 +1877,7 @@ fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
 /// Clean up an overlay filesystem.
 /// Log the error inside this function to skip the repetitive Err matching when unnecessary.
 pub fn cleanup_overlay(workload_id: &str) -> Result<()> {
-    let root = Path::new(STORAGE_ROOT);
-    let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
+    let overlay_root = overlay_root_for_workload(workload_id)?;
     let merged_path = overlay_root.join("merged");
 
     // Unmount nested bind mounts inside the overlay rootfs first. Volume mounts
@@ -1895,6 +2074,7 @@ pub fn prepare_for_run(image: &str) -> Result<PreparedOverlayRootfs> {
 /// If it exists but is unmounted (e.g. after VM restart), remounts preserving
 /// the upper layer that contains previous changes.
 pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<PreparedOverlayRootfs> {
+    validate_storage_id(overlay_id, "persistent overlay id")?;
     let workload_id = format!("persistent-{}", overlay_id);
 
     // Resolve image layers (same logic as prepare_overlay)
@@ -1904,7 +2084,7 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
         get_image_lowerdirs(image)?
     };
 
-    let setup = OverlaySetup::new(&workload_id);
+    let setup = OverlaySetup::new(&workload_id)?;
     let overlay = setup.execute_or_remount(lowerdirs)?;
 
     debug!(
@@ -1927,8 +2107,10 @@ pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<(
 /// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
 fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
     let mut mounted_paths = Vec::new();
+    let rootfs_path = Path::new(rootfs);
 
     for (tag, container_path, read_only) in mounts {
+        validate_storage_id(tag, "mount tag")?;
         debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
 
         // First, mount the virtiofs device at a staging location
@@ -1970,14 +2152,13 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         }
 
         // Now bind-mount into the container rootfs
-        let target_path = format!("{}{}", rootfs, container_path);
-        std::fs::create_dir_all(&target_path)?;
+        let target_path = ensure_mount_target_under_root(rootfs_path, container_path)?;
 
         // Check if already bind-mounted
-        if !is_mountpoint(Path::new(&target_path)) {
+        if !is_mountpoint(&target_path) {
             info!(
                 source = %virtiofs_mount.display(),
-                target = %target_path,
+                target = %target_path.display(),
                 read_only = %read_only,
                 "bind-mounting into container"
             );
@@ -1987,11 +2168,12 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
                 .map_err(|e| StorageError::Internal {
                     message: format!("invalid source: {}", e),
                 })?;
-            let bind_dst = std::ffi::CString::new(target_path.as_str()).map_err(|e| {
-                StorageError::Internal {
-                    message: format!("invalid target: {}", e),
-                }
-            })?;
+            let bind_dst =
+                std::ffi::CString::new(target_path.to_string_lossy().as_ref()).map_err(|e| {
+                    StorageError::Internal {
+                        message: format!("invalid target: {}", e),
+                    }
+                })?;
             // SAFETY: bind mount with MS_BIND flag
             let rc = unsafe {
                 libc::mount(
@@ -2004,7 +2186,7 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
             };
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
-                warn!(error = %err, target = %target_path, "failed to bind-mount");
+                warn!(error = %err, target = %target_path.display(), "failed to bind-mount");
                 continue;
             }
 
@@ -2023,7 +2205,7 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
             }
         }
 
-        mounted_paths.push(PathBuf::from(target_path));
+        mounted_paths.push(target_path);
     }
 
     Ok(mounted_paths)
@@ -2617,5 +2799,41 @@ mod tests {
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
         );
+    }
+
+    #[test]
+    fn test_validate_storage_id_rejects_traversal() {
+        assert!(validate_storage_id("../escape", "workload_id").is_err());
+        assert!(validate_storage_id("foo/bar", "workload_id").is_err());
+    }
+
+    #[test]
+    fn test_validate_container_destination_path_requires_absolute() {
+        assert!(validate_container_destination_path("var/data").is_err());
+        assert!(validate_container_destination_path("/").is_err());
+        assert!(validate_container_destination_path("/var/data").is_ok());
+    }
+
+    #[test]
+    fn test_ensure_mount_target_under_root_rejects_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        assert!(ensure_mount_target_under_root(&rootfs, "/../../escape").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_mount_target_under_root_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        symlink(outside.path(), rootfs.join("link-out")).unwrap();
+        assert!(ensure_mount_target_under_root(&rootfs, "/link-out/dir").is_err());
     }
 }

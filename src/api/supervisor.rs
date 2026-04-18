@@ -196,6 +196,11 @@ impl Supervisor {
     /// layout used by `AgentManager::new_internal` and exposed via
     /// `vm_data_dir` / the `machine data-dir` CLI command.
     fn get_machine_log_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        if crate::data::validate_vm_name(name, "machine name").is_err() {
+            tracing::warn!(machine = %name, "skipping invalid machine name when resolving log path");
+            return None;
+        }
+
         let log_path = crate::agent::vm_data_dir(name).join("agent-console.log");
         if log_path.exists() {
             Some(log_path)
