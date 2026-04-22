@@ -126,18 +126,7 @@ pub fn resolve_process_identity(
     }
 
     let spec = normalized.expect("checked above");
-    let (user_token, group_token) = match spec.split_once(':') {
-        Some((user, group)) => {
-            if user.is_empty() {
-                return Err("invalid empty user in OCI image config".to_string());
-            }
-            if group.is_empty() {
-                return Err("invalid empty group in OCI image config".to_string());
-            }
-            (user, Some(group))
-        }
-        None => (spec, None),
-    };
+    let (user_token, group_token) = parse_user_spec(spec)?;
 
     let resolved_user = resolve_user_token(user_token, &passwd_entries)?;
     let primary_gid = match group_token {
@@ -166,6 +155,21 @@ pub fn resolve_process_identity(
         },
         home,
     })
+}
+
+fn parse_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
+    match spec.split_once(':') {
+        Some((user, group)) => {
+            if user.is_empty() {
+                return Err("invalid empty user in OCI image config".to_string());
+            }
+            if group.is_empty() {
+                return Err("invalid empty group in OCI image config".to_string());
+            }
+            Ok((user, Some(group)))
+        }
+        None => Ok((spec, None)),
+    }
 }
 
 fn resolve_default_root_identity(
@@ -1091,6 +1095,20 @@ mod tests {
         assert_eq!(identity.user.gid, 2345);
         assert!(identity.user.additional_gids.is_empty());
         assert!(identity.home.is_none());
+    }
+
+    #[test]
+    fn test_parse_user_spec_rejects_empty_user_or_group() {
+        assert_eq!(
+            parse_user_spec(":1000"),
+            Err("invalid empty user in OCI image config".to_string())
+        );
+        assert_eq!(
+            parse_user_spec("steam:"),
+            Err("invalid empty group in OCI image config".to_string())
+        );
+        assert_eq!(parse_user_spec("steam"), Ok(("steam", None)));
+        assert_eq!(parse_user_spec("steam:audio"), Ok(("steam", Some("audio"))));
     }
 
     #[test]

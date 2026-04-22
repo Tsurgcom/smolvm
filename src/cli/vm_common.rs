@@ -282,20 +282,20 @@ pub(crate) struct ImageRuntimeDefaults {
 
 pub(crate) fn resolve_image_runtime_defaults(
     image_info: Option<&ImageInfo>,
-    provided_env: &[(String, String)],
+    env: &[(String, String)],
     explicit_workdir: Option<&str>,
 ) -> ImageRuntimeDefaults {
-    let mut env = Vec::new();
+    let mut resolved_env = Vec::new();
 
     if let Some(image_info) = image_info {
         for spec in &image_info.env {
             if let Some((key, value)) = smolvm::util::parse_env_spec(spec) {
-                apply_env_override(&mut env, key, value);
+                apply_env_override(&mut resolved_env, key, value);
             }
         }
     }
 
-    env = merge_env_overrides(&env, provided_env);
+    resolved_env = merge_env_overrides(&resolved_env, env);
 
     let workdir = explicit_workdir
         .map(str::to_string)
@@ -303,7 +303,11 @@ pub(crate) fn resolve_image_runtime_defaults(
 
     let user = image_info.and_then(|info| info.user.clone());
 
-    ImageRuntimeDefaults { env, workdir, user }
+    ImageRuntimeDefaults {
+        env: resolved_env,
+        workdir,
+        user,
+    }
 }
 
 pub(crate) fn merge_env_overrides(
@@ -1631,16 +1635,13 @@ mod init_runner_tests {
             Some("/image-workdir"),
             Some("steam"),
         );
-        let provided_env = vec![
+        let env = vec![
             ("BAR".to_string(), "from-cli".to_string()),
             ("BAZ".to_string(), "from-cli".to_string()),
         ];
 
-        let defaults = resolve_image_runtime_defaults(
-            Some(&image_info),
-            &provided_env,
-            Some("/explicit-workdir"),
-        );
+        let defaults =
+            resolve_image_runtime_defaults(Some(&image_info), &env, Some("/explicit-workdir"));
 
         assert_eq!(
             defaults.env,
@@ -1661,12 +1662,12 @@ mod init_runner_tests {
             Some("/image-workdir"),
             Some("1000:1000"),
         );
-        let provided_env = vec![
+        let env = vec![
             ("BAR".to_string(), "from-cli".to_string()),
             ("BAR".to_string(), "last-cli".to_string()),
         ];
 
-        let defaults = resolve_image_runtime_defaults(Some(&image_info), &provided_env, None);
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &env, None);
 
         assert_eq!(
             defaults.env,
@@ -1681,12 +1682,11 @@ mod init_runner_tests {
 
     #[test]
     fn resolve_image_runtime_defaults_falls_back_to_explicit_values_without_image_info() {
-        let provided_env = vec![("FOO".to_string(), "from-explicit".to_string())];
+        let env = vec![("FOO".to_string(), "from-explicit".to_string())];
 
-        let defaults =
-            resolve_image_runtime_defaults(None, &provided_env, Some("/explicit-workdir"));
+        let defaults = resolve_image_runtime_defaults(None, &env, Some("/explicit-workdir"));
 
-        assert_eq!(defaults.env, provided_env);
+        assert_eq!(defaults.env, env);
         assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
         assert!(defaults.user.is_none());
     }

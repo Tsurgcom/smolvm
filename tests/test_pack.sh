@@ -262,6 +262,12 @@ test_pack_bundled_libkrun_has_required_symbols() {
     # Verify all required symbols exist in the bundled library.
     # This catches the bug where an older system libkrun gets bundled
     # instead of the one smolvm was built against.
+    #
+    # Symbol inspection is platform-specific here:
+    # - macOS uses Mach-O, where `nm -gU` lists external symbols and C exports
+    #   appear with a leading underscore (for example `_krun_create_ctx`)
+    # - Linux uses ELF, where `nm -D --defined-only` lists dynamic exports and
+    #   the same symbol appears without the underscore (`krun_create_ctx`)
     local symbols nm_prefix
     if [[ "$(uname)" == "Darwin" ]]; then
         symbols=$(nm -gU "$libkrun" 2>/dev/null) || {

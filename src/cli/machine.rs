@@ -526,14 +526,14 @@ impl RunCmd {
             vec![DEFAULT_SHELL_CMD.to_string()]
         };
 
-        let provided_env = parse_env_list(&params.env);
+        let env = parse_env_list(&params.env);
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
         if let Some(ref img) = image {
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
-                &provided_env,
+                &env,
                 params.workdir.as_deref(),
             );
             if self.detach {
@@ -573,7 +573,7 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
-                                env: provided_env.clone(),
+                                env: env.clone(),
                                 workdir: params.workdir.clone(),
                                 image: Some(img.clone()),
                                 entrypoint: params.entrypoint.clone(),
@@ -649,8 +649,7 @@ impl RunCmd {
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>();
                 if !is_idle {
-                    let pid =
-                        client.vm_exec_background(command, provided_env, params.workdir.clone())?;
+                    let pid = client.vm_exec_background(command, env, params.workdir.clone())?;
                     tracing::info!(pid = pid, "background workload started");
                 }
 
@@ -712,18 +711,14 @@ impl RunCmd {
                 let exit_code = if interactive || tty {
                     client.vm_exec_interactive(
                         command,
-                        provided_env,
+                        env,
                         params.workdir.clone(),
                         self.timeout,
                         tty,
                     )?
                 } else {
-                    let (exit_code, stdout, stderr) = client.vm_exec(
-                        command,
-                        provided_env,
-                        params.workdir.clone(),
-                        self.timeout,
-                    )?;
+                    let (exit_code, stdout, stderr) =
+                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
                     }
@@ -799,7 +794,7 @@ impl ExecCmd {
         // AgentManager::Drop which calls stop() and kills the VM.
         manager.detach();
 
-        let provided_env = parse_env_list(&self.env);
+        let env = parse_env_list(&self.env);
 
         // Load machine record for workdir and image info
         let name = self.name.clone().unwrap_or_else(|| "default".to_string());
@@ -818,7 +813,7 @@ impl ExecCmd {
         if self.stream {
             let events = client.vm_exec_streaming(
                 self.command.clone(),
-                provided_env.clone(),
+                env.clone(),
                 workdir.clone(),
                 self.timeout,
             )?;
@@ -866,7 +861,7 @@ impl ExecCmd {
             };
             let configured_env = vm_common::merge_env_overrides(
                 record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
-                &provided_env,
+                &env,
             );
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
@@ -904,7 +899,7 @@ impl ExecCmd {
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
-                    provided_env.clone(),
+                    env.clone(),
                     workdir.clone(),
                     self.timeout,
                     self.tty,
@@ -912,12 +907,8 @@ impl ExecCmd {
                 std::process::exit(exit_code);
             }
 
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                self.command.clone(),
-                provided_env,
-                workdir.clone(),
-                self.timeout,
-            )?;
+            let (exit_code, stdout, stderr) =
+                client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
     }
