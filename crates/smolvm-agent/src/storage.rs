@@ -404,6 +404,7 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         cmd: Vec::new(),
         env: Vec::new(),
         workdir: None,
+        user: None,
     })
 }
 
@@ -1099,7 +1100,7 @@ where
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
         let mut tar_cmd = Command::new("tar");
-        tar_cmd.args(["--no-same-owner", "-xzf", "-", "-C"]);
+        tar_cmd.args(["-xzf", "-", "-C"]);
         tar_cmd.arg(&layer_dir);
         tar_cmd.stdin(crane_stdout);
         tar_cmd.stdout(Stdio::null());
@@ -1168,12 +1169,16 @@ where
     let os = config_json["os"].as_str().unwrap_or("linux").to_string();
     let created = config_json["created"].as_str().map(String::from);
 
-    // Extract OCI config fields (Entrypoint, Cmd, Env, WorkingDir)
+    // Extract OCI config fields (Entrypoint, Cmd, Env, WorkingDir, User)
     let oci_config = &config_json["config"];
     let entrypoint = json_string_array(oci_config, "Entrypoint");
     let cmd = json_string_array(oci_config, "Cmd");
     let env = json_string_array(oci_config, "Env");
     let workdir = oci_config["WorkingDir"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let user = oci_config["User"]
         .as_str()
         .filter(|s| !s.is_empty())
         .map(String::from);
@@ -1191,6 +1196,7 @@ where
         cmd,
         env,
         workdir,
+        user,
     })
 }
 
@@ -1270,6 +1276,10 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(String::from);
+    let user = oci_config["User"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     Ok(Some(ImageInfo {
         reference: image.to_string(),
@@ -1284,6 +1294,7 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         cmd,
         env,
         workdir,
+        user,
     }))
 }
 
@@ -2009,6 +2020,7 @@ pub fn run_command(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
@@ -2037,7 +2049,9 @@ pub fn run_command(
 
         // Create OCI spec
         let workdir_str = workdir.unwrap_or("/");
-        let mut spec = OciSpec::new(command, env, workdir_str, false);
+        let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
+            .map_err(StorageError::new)?;
+        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
 
         // Add virtiofs bind mounts to OCI spec
         for (tag, container_path, read_only) in mounts {

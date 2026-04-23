@@ -481,11 +481,14 @@ impl RunCmd {
             if let Err(e) = vm_common::run_init_commands(
                 &mut client,
                 &params.init,
-                image.as_deref(),
-                &init_env,
-                params.workdir.as_deref(),
-                &record_mounts,
-                "default",
+                vm_common::InitRunContext {
+                    image: image.as_deref(),
+                    image_info: image_info.as_ref(),
+                    env: &init_env,
+                    workdir: params.workdir.as_deref(),
+                    record_mounts: &record_mounts,
+                    overlay_id: "default",
+                },
             ) {
                 // Ephemeral VMs have no state to preserve — `kill()`
                 // matches the success path's lifetime semantics
@@ -528,6 +531,11 @@ impl RunCmd {
 
         // Two modes: with image or bare VM (no image)
         if let Some(ref img) = image {
+            let defaults = vm_common::resolve_image_runtime_defaults(
+                image_info.as_ref(),
+                &env,
+                params.workdir.as_deref(),
+            );
             if self.detach {
                 // Detach mode: persist the record with image info.
                 // The VM is already running. The image will be pulled and
@@ -565,7 +573,7 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
-                                env: parse_env_list(&params.env),
+                                env: env.clone(),
                                 workdir: params.workdir.clone(),
                                 image: Some(img.clone()),
                                 entrypoint: params.entrypoint.clone(),
@@ -596,16 +604,18 @@ impl RunCmd {
 
                 let exit_code = if interactive || tty {
                     let config = RunConfig::new(img, command)
-                        .with_env(env)
-                        .with_workdir(params.workdir.clone())
+                        .with_env(defaults.env.clone())
+                        .with_workdir(defaults.workdir.clone())
+                        .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
                         .with_tty(tty);
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
-                        .with_env(env)
-                        .with_workdir(params.workdir.clone())
+                        .with_env(defaults.env)
+                        .with_workdir(defaults.workdir)
+                        .with_user(defaults.user)
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout);
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
@@ -803,7 +813,7 @@ impl ExecCmd {
         if self.stream {
             let events = client.vm_exec_streaming(
                 self.command.clone(),
-                env,
+                env.clone(),
                 workdir.clone(),
                 self.timeout,
             )?;
@@ -838,14 +848,35 @@ impl ExecCmd {
             .unwrap_or_default();
 
         if let Some(ref image) = record_image {
+            let image_info = match client.query(image) {
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        image = %image,
+                        "failed to query local image metadata"
+                    );
+                    None
+                }
+            };
+            let configured_env = vm_common::merge_env_overrides(
+                record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
+                &env,
+            );
+            let defaults = vm_common::resolve_image_runtime_defaults(
+                image_info.as_ref(),
+                &configured_env,
+                workdir.as_deref(),
+            );
             // Image-based machine: exec inside the image's rootfs via crun.
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
             let machine_name = name.clone();
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                    .with_env(env)
-                    .with_workdir(workdir.clone())
+                    .with_env(defaults.env.clone())
+                    .with_workdir(defaults.workdir.clone())
+                    .with_user(defaults.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
@@ -855,8 +886,9 @@ impl ExecCmd {
             }
 
             let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                .with_env(env)
-                .with_workdir(workdir.clone())
+                .with_env(defaults.env)
+                .with_workdir(defaults.workdir)
+                .with_user(defaults.user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
                 .with_persistent_overlay(Some(machine_name));
@@ -867,7 +899,7 @@ impl ExecCmd {
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
-                    env,
+                    env.clone(),
                     workdir.clone(),
                     self.timeout,
                     self.tty,

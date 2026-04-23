@@ -262,12 +262,30 @@ test_pack_bundled_libkrun_has_required_symbols() {
     # Verify all required symbols exist in the bundled library.
     # This catches the bug where an older system libkrun gets bundled
     # instead of the one smolvm was built against.
-    local symbols
-    symbols=$(nm -gU "$libkrun" 2>/dev/null) || { echo "FAIL: nm failed on $libkrun"; return 1; }
+    #
+    # Symbol inspection is platform-specific here:
+    # - macOS uses Mach-O, where `nm -gU` lists external symbols and C exports
+    #   appear with a leading underscore (for example `_krun_create_ctx`)
+    # - Linux uses ELF, where `nm -D --defined-only` lists dynamic exports and
+    #   the same symbol appears without the underscore (`krun_create_ctx`)
+    local symbols nm_prefix
+    if [[ "$(uname)" == "Darwin" ]]; then
+        symbols=$(nm -gU "$libkrun" 2>/dev/null) || {
+            echo "FAIL: nm failed on $libkrun"
+            return 1
+        }
+        nm_prefix="_"
+    else
+        symbols=$(nm -D --defined-only "$libkrun" 2>/dev/null) || {
+            echo "FAIL: nm failed on $libkrun"
+            return 1
+        }
+        nm_prefix=""
+    fi
 
     local missing=0
     for sym in krun_create_ctx krun_add_disk2 krun_add_vsock_port2 krun_start_enter; do
-        if ! echo "$symbols" | grep -q "_${sym}$"; then
+        if ! echo "$symbols" | grep -q "${nm_prefix}${sym}$"; then
             echo "FAIL: bundled libkrun missing required symbol: $sym"
             missing=1
         fi
