@@ -23,3 +23,27 @@ pub use manager::{
 
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
+
+/// Compute the `virgl_flags` bitmask for `krun_set_gpu_options2`.
+///
+/// Shared by both the static (`launcher.rs`) and dynamic (`launcher_dynamic.rs`)
+/// launchers so they can never silently diverge.
+///
+/// Flag values from `libkrun/include/libkrun.h` virglrenderer bindings:
+///   bit 0  — VIRGLRENDERER_USE_EGL         (Linux): EGL context for GPU rendering
+///   bit 3  — VIRGLRENDERER_USE_SURFACELESS  (Linux): no display server required
+///   bit 6  — VIRGLRENDERER_VENUS           (both): Vulkan-over-virtio-gpu (Venus ICD)
+///   bit 7  — VIRGLRENDERER_NO_VIRGL        (macOS): skip OpenGL (vrend) init — without
+///             EGL, vrend_renderer_init crashes on null platform function pointers
+///   bit 9  — VIRGLRENDERER_RENDER_SERVER   (Linux): required for the Venus render-server
+///             subprocess (spawn is Linux-only; on macOS render_server_fd is always None)
+fn gpu_virgl_flags() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        (1 << 0) | (1 << 3) | (1 << 6) | (1 << 9)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (1 << 6) | (1 << 7)
+    }
+}

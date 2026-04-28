@@ -327,8 +327,8 @@ impl PackRunCmd {
             eprintln!("debug: storage={}", storage_path.display());
             eprintln!("debug: vsock={}", vsock_path.display());
             eprintln!(
-                "debug: resources cpus={} mem={} net={}",
-                resources.cpus, resources.memory_mib, resources.network
+                "debug: resources cpus={} mem={} net={} gpu={}",
+                resources.cpus, resources.memory_mib, resources.network, resources.gpu
             );
         }
 

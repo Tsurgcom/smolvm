@@ -139,6 +139,14 @@ pub struct PackCreateCmd {
     /// Load workload configuration from a Smolfile (TOML)
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
+
+    /// Enable GPU acceleration (Vulkan via virtio-gpu) in the packed VM
+    ///
+    /// The packed binary will launch with a virtio-gpu device. The guest image
+    /// must include a compatible Vulkan ICD (e.g., Mesa Venus on Fedora via
+    /// the slp/mesa-libkrun-vulkan COPR, or standard Mesa on Linux hosts).
+    #[arg(long)]
+    pub gpu: bool,
 }
 
 impl PackCreateCmd {
@@ -158,6 +166,7 @@ impl PackCreateCmd {
             self.cpus,
             self.mem,
             self.oci_platform.clone(),
+            self.gpu,
             self.smolfile.clone(),
         )?;
 
@@ -399,6 +408,7 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.gpu = pack_config.gpu;
 
         // Start with OCI image config as baseline
         manifest.entrypoint = image_info.entrypoint.clone();
@@ -654,6 +664,7 @@ impl PackCreateCmd {
             self.cpus,
             self.mem,
             self.oci_platform.clone(),
+            self.gpu,
             self.smolfile.clone(),
         )?;
 
@@ -676,6 +687,8 @@ impl PackCreateCmd {
         manifest.mem = pack_config.mem;
         // Smolfile > source VM record > default
         manifest.network = pack_config.net.unwrap_or(vm.network);
+        // CLI --gpu > Smolfile gpu > source VM record gpu > false
+        manifest.gpu = pack_config.gpu || vm.gpu.unwrap_or(false);
 
         // Entrypoint baseline: VmRecord > /bin/sh default
         manifest.entrypoint = if !vm.entrypoint.is_empty() {

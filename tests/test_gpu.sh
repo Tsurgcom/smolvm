@@ -174,6 +174,77 @@ run_test "GPU: --gpu-vram 0 rejected by validation" test_gpu_vram_zero_rejected 
 run_test "GPU: named machine DB persistence of --gpu flag" test_named_machine_gpu_persists || true
 
 # =============================================================================
+# Section 1b: pack create --gpu (manifest embedding)
+# =============================================================================
+# pack create --gpu must write gpu=true into the .smolmachine manifest so the
+# packed binary boots with a virtio-gpu device. We verify the round-trip:
+# pack create --gpu → .smolmachine → pack run → /dev/dri/renderD128 visible.
+
+echo ""
+echo "Running pack create --gpu tests..."
+
+test_pack_create_gpu_manifest() {
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local out_path="$tmp_dir/gpu-alpine"
+
+    echo "  Packing alpine:latest with --gpu..."
+    run_with_timeout 300 "$SMOLVM" pack create \
+        --image alpine:latest --gpu \
+        --output "$out_path" 2>&1 || {
+        rm -rf "$tmp_dir"
+        return 1
+    }
+    [[ -f "$out_path.smolmachine" ]] || {
+        echo "FAIL: no .smolmachine produced"
+        rm -rf "$tmp_dir"
+        return 1
+    }
+
+    # Run the packed binary and verify /dev/dri/renderD128 is present.
+    # pack run reads manifest.gpu and passes it to VmResources.
+    echo "  Running packed binary, checking for /dev/dri/renderD128..."
+    local run_out rc=0
+    run_out=$(run_with_timeout 120 "$SMOLVM" pack run \
+        --sidecar "$out_path.smolmachine" -- \
+        ls /dev/dri/renderD128 2>&1) || rc=$?
+
+    rm -rf "$tmp_dir"
+    [[ $rc -eq 0 ]] && [[ "$run_out" == *"renderD128"* ]] || {
+        echo "FAIL: renderD128 not present in GPU-packed binary (exit $rc, got: $run_out)"
+        return 1
+    }
+}
+
+test_pack_create_no_gpu_manifest() {
+    # Without --gpu, the packed binary must NOT have /dev/dri.
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local out_path="$tmp_dir/nogpu-alpine"
+
+    run_with_timeout 300 "$SMOLVM" pack create \
+        --image alpine:latest \
+        --output "$out_path" 2>&1 || {
+        rm -rf "$tmp_dir"
+        return 1
+    }
+
+    local run_out exit_code=0
+    run_out=$(run_with_timeout 120 "$SMOLVM" pack run \
+        --sidecar "$out_path.smolmachine" -- \
+        ls /dev/dri 2>&1) || exit_code=$?
+
+    rm -rf "$tmp_dir"
+    if [[ $exit_code -eq 0 ]] && echo "$run_out" | grep -qE "render|card"; then
+        echo "FAIL: /dev/dri present in non-GPU packed binary: $run_out"
+        return 1
+    fi
+}
+
+run_test "GPU: pack create --gpu embeds gpu=true in manifest" test_pack_create_gpu_manifest || true
+run_test "GPU: pack create without --gpu has no /dev/dri (isolation)" test_pack_create_no_gpu_manifest || true
+
+# =============================================================================
 # Section 2: Vulkan workloads (Fedora 42 + patched Mesa)
 # =============================================================================
 # Standard Fedora Mesa has a 16KB page-alignment bug that crashes Venus ICD

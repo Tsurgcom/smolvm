@@ -53,6 +53,9 @@ pub struct KrunFunctions {
     pub add_net_unixstream: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
     >,
+    /// Optional: krun_set_gpu_options2(ctx, virgl_flags, shm_size) — only present
+    /// when libkrun is built with GPU support.
+    pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
 }
 
 impl KrunFunctions {
@@ -121,6 +124,21 @@ impl KrunFunctions {
             }};
         }
 
+        // Optional symbols: present only when libkrun is built with certain features.
+        // Returns None (not an error) when the symbol is absent.
+        macro_rules! load_sym_opt {
+            ($name:ident) => {{
+                let sym_name = CString::new(stringify!($name)).expect("symbol name is static");
+                let sym = libc::dlsym(handle, sym_name.as_ptr());
+                if sym.is_null() {
+                    None
+                } else {
+                    #[allow(clippy::missing_transmute_annotations)]
+                    Some(std::mem::transmute(sym))
+                }
+            }};
+        }
+
         Ok(Self {
             _handle: handle,
             _fw_handle: fw_handle,
@@ -139,28 +157,9 @@ impl KrunFunctions {
             disable_implicit_vsock: load_sym!(krun_disable_implicit_vsock),
             add_vsock: load_sym!(krun_add_vsock),
             set_console_output: load_sym!(krun_set_console_output),
-            set_egress_policy: {
-                let sym_name =
-                    CString::new("krun_set_egress_policy").expect("symbol name is static");
-                let sym = libc::dlsym(handle, sym_name.as_ptr());
-                if sym.is_null() {
-                    None
-                } else {
-                    #[allow(clippy::missing_transmute_annotations)]
-                    Some(std::mem::transmute(sym))
-                }
-            },
-            add_net_unixstream: {
-                let sym_name =
-                    CString::new("krun_add_net_unixstream").expect("symbol name is static");
-                let sym = libc::dlsym(handle, sym_name.as_ptr());
-                if sym.is_null() {
-                    None
-                } else {
-                    #[allow(clippy::missing_transmute_annotations)]
-                    Some(std::mem::transmute(sym))
-                }
-            },
+            set_egress_policy: load_sym_opt!(krun_set_egress_policy),
+            add_net_unixstream: load_sym_opt!(krun_add_net_unixstream),
+            set_gpu_options2: load_sym_opt!(krun_set_gpu_options2),
         })
     }
 }
@@ -292,6 +291,34 @@ pub fn launch_agent_vm_dynamic(
     if unsafe { (krun.set_vm_config)(ctx, config.resources.cpus, config.resources.memory_mib) } < 0
     {
         free_ctx_on_err!("krun_set_vm_config failed");
+    }
+
+    // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
+    // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
+    // explanation of each flag's purpose on Linux vs macOS.
+    if config.resources.gpu {
+        let virgl_flags = super::gpu_virgl_flags();
+        let vram_mib = config.resources.effective_gpu_vram_mib();
+        let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
+
+        match krun.set_gpu_options2 {
+            Some(set_gpu) => {
+                let ret = unsafe { set_gpu(ctx, virgl_flags, vram_bytes) };
+                if ret < 0 {
+                    free_ctx_on_err!(format!(
+                        "krun_set_gpu_options2 failed (ret={}). Check that virglrenderer is installed.",
+                        ret
+                    ));
+                }
+                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+            }
+            None => {
+                free_ctx_on_err!(
+                    "libkrun was built without GPU support (krun_set_gpu_options2 not found). \
+                     Rebuild libkrun with GPU=1 — see project README for details."
+                );
+            }
+        }
     }
 
     // Set root filesystem

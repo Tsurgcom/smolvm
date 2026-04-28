@@ -306,6 +306,8 @@ pub struct PackConfig {
     /// so `--from-vm` can distinguish "Smolfile says net = false" from "no
     /// Smolfile, fall back to source VM's setting".
     pub net: Option<bool>,
+    /// Whether GPU acceleration is enabled in the packed VM.
+    pub gpu: bool,
 }
 
 /// Resolve pack configuration by merging CLI flags with an optional Smolfile.
@@ -319,12 +321,14 @@ pub struct PackConfig {
 ///   oci_platform: CLI --oci-platform > [artifact].oci_platform > None
 ///   env:          Smolfile top-level env (trimmed)
 ///   workdir:      Smolfile top-level workdir
+///   gpu:          CLI --gpu (true overrides) > Smolfile gpu > false
 pub fn resolve_pack_config(
     cli_image: Option<String>,
     cli_entrypoint: Option<String>,
     cli_cpus: u8,
     cli_mem: u32,
     cli_oci_platform: Option<String>,
+    cli_gpu: bool,
     smolfile_path: Option<PathBuf>,
 ) -> smolvm::Result<PackConfig> {
     let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
@@ -342,6 +346,7 @@ pub fn resolve_pack_config(
                 env: vec![],
                 workdir: None,
                 net: None,
+                gpu: cli_gpu,
             });
         }
     };
@@ -407,5 +412,7 @@ pub fn resolve_pack_config(
                 sf.net // None if key absent, Some(true/false) if explicit
             }
         },
+        // CLI --gpu wins; Smolfile gpu = true also enables it.
+        gpu: cli_gpu || sf.gpu.unwrap_or(false),
     })
 }
