@@ -4,7 +4,9 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
-use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
+use crate::data::consts::{
+    ENV_SMOLVM_GPU, ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR, ENV_VALUE_ON,
+};
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
@@ -74,6 +76,69 @@ extern "C" {
     fn krun_add_vsock(ctx: u32, tsi_features: u32) -> i32;
 }
 
+/// Dynamically resolve `krun_set_gpu_options2` at runtime via dlsym.
+///
+/// Returns `None` when libkrun was built without the `gpu` feature (the symbol
+/// is absent from the binary). Callers must treat `None` as a hard error and
+/// surface a clear message — GPU cannot be emulated in software.
+///
+/// # Build requirements
+///
+/// libkrun must be compiled with `GPU=1`:
+///
+/// ```text
+/// Linux:  make BLK=1 NET=1 GPU=1
+/// macOS:  make BLK=1 NET=1 GPU=1 TIMESYNC=1
+/// ```
+///
+/// At runtime the host needs virglrenderer and a Vulkan driver. On macOS these
+/// are bundled in the smolvm distribution (`lib/libvirglrenderer.1.dylib` and
+/// `lib/libMoltenVK.dylib`). On Linux, install the system packages and rebuild
+/// libkrun with `GPU=1`.
+unsafe fn resolve_krun_set_gpu_options2() -> Option<unsafe extern "C" fn(u32, u32, u64) -> i32> {
+    let name = c"krun_set_gpu_options2";
+    let ptr = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+    if ptr.is_null() {
+        None
+    } else {
+        // ABI: krun_set_gpu_options2(ctx_id: u32, virgl_flags: u32, shm_size: u64) -> i32
+        // Source: libkrun/include/libkrun.h:609-611
+        Some(std::mem::transmute::<
+            *mut libc::c_void,
+            unsafe extern "C" fn(u32, u32, u64) -> i32,
+        >(ptr))
+    }
+}
+
+// virglrenderer flags for krun_set_gpu_options2.
+// Flag values from libkrun/include/libkrun.h:573-584 (virglrenderer bindings).
+//
+// Venus provides Vulkan inside the guest via virtio-gpu transport.
+//
+// Linux: EGL + surfaceless lets virglrenderer create a Vulkan device without a
+// display server.  RENDER_SERVER tells virglrenderer to call get_server_fd and
+// communicate with the virgl_render_server subprocess for Venus Vulkan; without
+// it virglrenderer ignores the render-server socket and vkEnumeratePhysicalDevices
+// returns 0 physical devices.  RENDER_SERVER is Linux-only because the render
+// server subprocess is only spawned on Linux (see virtio_gpu.rs:367,
+// #[cfg(target_os = "linux")]); on other platforms render_server_fd is always
+// None and get_server_fd would return -1.
+//
+// macOS: Venus uses MoltenVK directly (not EGL), so EGL and RENDER_SERVER are
+// omitted.
+#[cfg(target_os = "linux")]
+const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
+#[cfg(target_os = "linux")]
+const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
+const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+// Skip OpenGL (vrend) init on macOS — without EGL, vrend_renderer_init crashes
+// because it calls through NULL platform function pointers.  Venus (Vulkan) works
+// fine without vrend; DRI2/OpenGL in the guest is not needed for Venus workloads.
+#[cfg(not(target_os = "linux"))]
+const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+#[cfg(target_os = "linux")]
+const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+
 /// Find the directory containing libkrunfw by checking explicit overrides and
 /// paths relative to the current executable.
 ///
@@ -116,6 +181,34 @@ pub fn find_lib_dir() -> Option<PathBuf> {
     None
 }
 
+/// Load a single library into the global symbol namespace via `dlopen(RTLD_GLOBAL)`.
+///
+/// Makes the library visible to all subsequent `dlopen` calls by soname, without
+/// requiring `LD_LIBRARY_PATH` (which glibc caches at process startup and never re-reads).
+/// The handle is intentionally leaked — the library must remain resident.
+///
+/// Returns `true` if the library was loaded successfully.
+fn dlopen_global(path: &Path) -> bool {
+    let Ok(path_c) = CString::new(path.to_string_lossy().as_bytes()) else {
+        return false;
+    };
+    unsafe {
+        let handle = libc::dlopen(path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+        if handle.is_null() {
+            let err = libc::dlerror();
+            let msg = if err.is_null() {
+                "unknown error".to_string()
+            } else {
+                CStr::from_ptr(err).to_string_lossy().to_string()
+            };
+            tracing::warn!(path = %path.display(), error = %msg, "failed to preload library");
+            return false;
+        }
+        // Intentionally leak — library must stay loaded.
+        true
+    }
+}
+
 /// Preload libkrunfw with `RTLD_GLOBAL` so libkrun's internal `dlopen("libkrunfw.so.5")` finds it.
 ///
 /// Setting `LD_LIBRARY_PATH` via `std::env::set_var` is insufficient because glibc caches
@@ -129,24 +222,39 @@ fn preload_libkrunfw() {
     let Some(lib_dir) = find_lib_dir() else {
         return;
     };
+    dlopen_global(&lib_dir.join(libkrunfw_filename()));
+}
 
-    let lib_path = lib_dir.join(libkrunfw_filename());
-    let Ok(lib_path_c) = CString::new(lib_path.to_string_lossy().as_bytes()) else {
+/// Preload bundled libepoxy and libvirglrenderer with `RTLD_GLOBAL` so libkrun's
+/// virglrenderer usage resolves them before searching system library paths.
+/// Also sets `VIRGL_RENDER_SERVER_PATH` to the bundled render server binary if present.
+///
+/// `virtio_gpu.rs` reads `VIRGL_RENDER_SERVER_PATH` via `env::var` in the same process,
+/// so `set_var` here wires the bundled path without modifying libkrun source.
+///
+/// No-op if libvirglrenderer is not found in the bundled lib dir (falls back to system install).
+#[cfg(target_os = "linux")]
+fn preload_libvirglrenderer() {
+    let Some(lib_dir) = find_lib_dir() else {
         return;
     };
 
-    unsafe {
-        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if handle.is_null() {
-            let err = libc::dlerror();
-            let err_msg = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                CStr::from_ptr(err).to_string_lossy().to_string()
-            };
-            tracing::warn!(path = %lib_path.display(), error = %err_msg, "failed to preload libkrunfw");
+    // libepoxy must be loaded before libvirglrenderer (it's a runtime dependency).
+    for lib_name in &["libepoxy.so.0", "libvirglrenderer.so.1"] {
+        let path = lib_dir.join(lib_name);
+        if path.exists() {
+            dlopen_global(&path);
         }
-        // Intentionally leak the handle — libkrunfw must stay loaded for libkrun to use it.
+    }
+
+    // Point libkrun at the bundled render server subprocess.
+    // set_var is safe here: this runs in the single-threaded child process after fork.
+    let server = lib_dir.join("virgl_render_server");
+    if server.exists() && std::env::var("VIRGL_RENDER_SERVER_PATH").is_err() {
+        if let Some(s) = server.to_str() {
+            #[allow(deprecated)]
+            std::env::set_var("VIRGL_RENDER_SERVER_PATH", s);
+        }
     }
 }
 
@@ -239,6 +347,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
 
+    // Preload bundled virglrenderer libs and wire the render server path.
+    #[cfg(target_os = "linux")]
+    preload_libvirglrenderer();
+
     // Preload libkrunfw so libkrun's internal dlopen can find it
     preload_libkrunfw();
 
@@ -262,6 +374,51 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
+        }
+
+        // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
+        // Requires libkrun built with `gpu` feature and host virglrenderer.
+        // On macOS, also requires MoltenVK (Vulkan → Metal translation).
+        if resources.gpu {
+            #[cfg(target_os = "linux")]
+            let virgl_flags = VIRGLRENDERER_USE_EGL
+                | VIRGLRENDERER_USE_SURFACELESS
+                | VIRGLRENDERER_VENUS
+                | VIRGLRENDERER_RENDER_SERVER;
+            // NO_VIRGL skips OpenGL (vrend) init on macOS — without EGL, vrend_renderer_init
+            // crashes on null platform function pointers.  Venus (Vulkan) is sufficient for
+            // all supported GPU workloads (vulkaninfo, WebGL uses SwiftShader anyway).
+            #[cfg(not(target_os = "linux"))]
+            let virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL;
+            // Size the GPU shared-memory region. Caller may override
+            // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
+            // default is `DEFAULT_GPU_VRAM_MIB`.
+            let vram_mib = resources.effective_gpu_vram_mib();
+            let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
+
+            // Resolve krun_set_gpu_options2 dynamically — it may not exist
+            // if libkrun was built without the `gpu` feature.
+            let set_gpu = match resolve_krun_set_gpu_options2() {
+                Some(f) => f,
+                None => {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure gpu",
+                        "libkrun was built without GPU support (krun_set_gpu_options2 not found). \
+                         Rebuild libkrun with GPU=1 — see project README for details.",
+                    ));
+                }
+            };
+
+            let ret = set_gpu(ctx, virgl_flags, vram_bytes);
+            if ret < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure gpu",
+                    format!("krun_set_gpu_options2 failed (ret={}). Check that virglrenderer is installed.", ret),
+                ));
+            }
+            tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
         }
 
         // Helper: evaluate a fallible expression, freeing ctx if it fails.
@@ -647,6 +804,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent to start SSH agent forwarding bridge
         if ssh_agent_socket.is_some() {
             env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
+        }
+
+        // Tell the agent GPU was requested so it can sanity-check the
+        // virtio-gpu device actually appeared in the guest. libkrun
+        // happily accepts `krun_set_gpu_options2` even if the embedded
+        // kernel lacks the driver; without this check the user sees
+        // "VM started" and discovers missing GPU only when their
+        // workload hits a rendering call.
+        if resources.gpu {
+            let gpu_env = format!("{}={}", ENV_SMOLVM_GPU, ENV_VALUE_ON);
+            if let Ok(cs) = CString::new(gpu_env) {
+                env_strings.push(cs);
+            }
         }
 
         // Tell the agent to start DNS filtering proxy

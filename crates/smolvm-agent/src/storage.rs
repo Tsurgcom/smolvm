@@ -28,6 +28,8 @@ const CONFIGS_DIR: &str = "configs";
 const MANIFESTS_DIR: &str = "manifests";
 const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
+const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
+const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
 
 fn validate_storage_id(value: &str, context: &str) -> Result<()> {
     if value.is_empty() {
@@ -41,6 +43,13 @@ fn validate_storage_id(value: &str, context: &str) -> Result<()> {
         return Err(StorageError::ValidationFailed {
             context: context.to_string(),
             reason: "too long (max 128 chars)".to_string(),
+        });
+    }
+
+    if value.contains('/') || value.contains('\\') {
+        return Err(StorageError::ValidationFailed {
+            context: context.to_string(),
+            reason: "path separators are not allowed".to_string(),
         });
     }
 
@@ -2052,6 +2061,7 @@ pub fn run_command(
         let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
             .map_err(StorageError::new)?;
         let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+        spec.add_gpu_devices_if_available();
 
         // Add virtiofs bind mounts to OCI spec
         for (tag, container_path, read_only) in mounts {
@@ -2621,11 +2631,19 @@ fn extract_registry_from_image(image: &str) -> String {
     if let Some(slash_pos) = image.find('/') {
         let potential_registry = &image[..slash_pos];
         if potential_registry.contains('.') || potential_registry.contains(':') {
-            return potential_registry.to_string();
+            return docker_config_registry_key(potential_registry).to_string();
         }
     }
     // Docker Hub uses this URL in config.json
-    "https://index.docker.io/v1/".to_string()
+    DOCKER_HUB_AUTH_CONFIG_KEY.to_string()
+}
+
+fn docker_config_registry_key(registry: &str) -> &str {
+    if DOCKER_HUB_REGISTRY_ALIASES.contains(&registry) {
+        DOCKER_HUB_AUTH_CONFIG_KEY
+    } else {
+        registry
+    }
 }
 
 /// Simple base64 encoding for auth string.
@@ -2920,6 +2938,38 @@ mod tests {
         assert_eq!(
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
+        );
+    }
+
+    #[test]
+    fn test_extract_registry_from_image_normalizes_docker_hub() {
+        assert_eq!(
+            extract_registry_from_image("alpine:latest"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+        assert_eq!(
+            extract_registry_from_image("library/alpine:latest"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+        assert_eq!(
+            extract_registry_from_image("docker.io/nginxinc/nginx-unprivileged:stable-alpine"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+        assert_eq!(
+            extract_registry_from_image("index.docker.io/library/alpine:latest"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+    }
+
+    #[test]
+    fn test_extract_registry_from_image_preserves_non_docker_hub_registry() {
+        assert_eq!(
+            extract_registry_from_image("ghcr.io/owner/repo:tag"),
+            "ghcr.io"
+        );
+        assert_eq!(
+            extract_registry_from_image("registry.example.com:5000/image:tag"),
+            "registry.example.com:5000"
         );
     }
 

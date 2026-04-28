@@ -58,8 +58,19 @@ fn format_boot_log(level: &str, msg: &str) -> String {
 /// Write a structured JSON log line to stderr during early boot,
 /// before tracing_subscriber is initialized. This keeps
 /// agent-console.log as valid JSON throughout.
+/// Also writes to /dev/kmsg so messages appear in dmesg.
 fn boot_log(level: &str, msg: &str) {
-    eprintln!("{}", format_boot_log(level, msg));
+    let line = format_boot_log(level, msg);
+    eprintln!("{}", line);
+    // Mirror to /dev/kmsg so dmesg captures early-boot messages even when
+    // the console-log pipe isn't receiving eprintln! output.
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+            let _ = writeln!(f, "smolvm-agent: {}", line);
+        }
+    }
 }
 mod dns_proxy;
 mod network;
@@ -96,6 +107,19 @@ const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
 /// Poll interval for checking process completion in VM exec.
 const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 
+/// Env var the host sets on guest init to signal GPU was requested.
+///
+/// This literal must match `smolvm::data::consts::ENV_SMOLVM_GPU` on
+/// the host. The agent crate does not depend on the host crate, so we
+/// redeclare the string here; a unit test on the host
+/// (`agent_env_constants_match`) asserts the two are in sync so a
+/// rename on one side can't silently desync the other.
+const ENV_SMOLVM_GPU: &str = "SMOLVM_GPU";
+
+/// Value signaling "on" for boolean SMOLVM_* sentinel env vars.
+/// Matches `smolvm::data::consts::ENV_VALUE_ON`.
+const ENV_VALUE_ON: &str = "1";
+
 /// Get system uptime in milliseconds (for timing relative to boot).
 fn uptime_ms() -> u64 {
     if let Ok(contents) = std::fs::read_to_string("/proc/uptime") {
@@ -119,6 +143,13 @@ fn main() {
     // When running as init (PID 1), we need these for the system to function.
     // This must happen before logging (which needs /dev for output).
     mount_essential_filesystems();
+
+    // Create /dev/dri device nodes if virtio-gpu is present.
+    // libkrun's init.c mounts /dev as a basic tmpfs, so DRM nodes are not
+    // auto-created by devtmpfs. We read major:minor from /sys/class/drm/ and
+    // mknod them so containers can access the GPU render node.
+    #[cfg(target_os = "linux")]
+    setup_gpu_dev_nodes();
 
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
@@ -239,6 +270,17 @@ fn main() {
     if dns_proxy::is_enabled() {
         info!("DNS filtering enabled, starting guest proxy");
         dns_proxy::start();
+    }
+
+    // If the host started us with --gpu, sanity-check that the guest
+    // kernel actually sees a virtio-gpu device. libkrun accepts the
+    // GPU config call regardless of whether the embedded kernel has
+    // the `virtio-gpu` driver compiled in, so the only place this
+    // mismatch surfaces is here. Without this log, the user discovers
+    // the missing GPU much later — when their workload makes a
+    // rendering call and crashes with a confused EGL/Vulkan error.
+    if std::env::var(ENV_SMOLVM_GPU).as_deref() == Ok(ENV_VALUE_ON) {
+        log_gpu_status();
     }
 
     info!(
@@ -421,6 +463,96 @@ fn mount_essential_filesystems() {
     // No-op on non-Linux platforms
 }
 
+/// Create /dev/dri device nodes for virtio-gpu if present.
+///
+/// libkrun's init.c mounts /dev as a basic tmpfs so the kernel's devtmpfs
+/// doesn't auto-populate DRM device nodes. This function reads each render
+/// node and card from /sys/class/drm/ and creates the corresponding
+/// character device node in /dev/dri/ so containers can access the GPU.
+#[cfg(target_os = "linux")]
+fn setup_gpu_dev_nodes() {
+    let sysfs_drm = std::path::Path::new("/sys/class/drm");
+    if !sysfs_drm.exists() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(sysfs_drm) else {
+        return;
+    };
+    let entries: Vec<_> = entries.flatten().collect();
+
+    // Only proceed if there are DRM nodes (render nodes or cards)
+    let has_nodes = entries.iter().any(|e| {
+        let n = e.file_name();
+        let s = n.to_string_lossy();
+        s.starts_with("renderD") || s.starts_with("card")
+    });
+    if !has_nodes {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all("/dev/dri");
+
+    for entry in &entries {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("renderD") && !name_str.starts_with("card") {
+            continue;
+        }
+
+        // Read major:minor from sysfs (e.g. "226:128\n")
+        let dev_file = sysfs_drm.join(&*name_str).join("dev");
+        let Ok(dev_str) = std::fs::read_to_string(&dev_file) else {
+            continue;
+        };
+        let parts: Vec<&str> = dev_str.trim().split(':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let Ok(major) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        let Ok(minor) = parts[1].parse::<u32>() else {
+            continue;
+        };
+
+        let node_path = format!("/dev/dri/{}", name_str);
+        let Ok(node_cstr) = std::ffi::CString::new(node_path) else {
+            continue;
+        };
+
+        // SAFETY: mknod a character device node with the DRM major:minor from sysfs
+        unsafe {
+            libc::mknod(
+                node_cstr.as_ptr(),
+                libc::S_IFCHR | 0o666,
+                libc::makedev(major, minor),
+            );
+        }
+    }
+}
+
+/// Log whether the GPU is accessible in the guest.
+///
+/// Called at startup when `ENV_SMOLVM_GPU` is set. Checks whether the virtio-gpu
+/// render node appeared in `/dev/dri/` after `setup_gpu_dev_nodes` ran. If not,
+/// the kernel was built without `virtio-gpu` or `drm` support and the workload
+/// will fail at Vulkan/EGL init rather than here — log a clear warning so the
+/// user knows to check the kernel config.
+#[cfg(target_os = "linux")]
+fn log_gpu_status() {
+    let render_node = std::path::Path::new("/dev/dri/renderD128");
+    if render_node.exists() {
+        info!("GPU: virtio-gpu render node present at /dev/dri/renderD128");
+    } else {
+        warn!(
+            "GPU: requested but /dev/dri/renderD128 not found — \
+             the guest kernel may lack virtio-gpu/drm support; \
+             Vulkan/EGL workloads will fail"
+        );
+    }
+}
+
 /// Set up persistent rootfs overlay using overlayfs on /dev/vdb.
 ///
 /// If /dev/vdb exists (overlay disk attached by host), this function:
@@ -444,18 +576,54 @@ fn setup_persistent_rootfs() {
     const STORAGE_TEMP_MOUNT: &str = "/mnt/storage";
     const NEWROOT: &str = "/mnt/newroot";
 
-    // Make root mount private — required for mount --move and pivot_root.
-    // libkrun's init.c sets MS_SHARED; we override with MS_PRIVATE.
+    // pivot_root requires that the current root mount is NOT shared.
+    // The kernel mounts virtiofs as shared:1 by default.  We must make it
+    // private before pivot_root will accept it.
+    //
+    // Strategy:
+    // 1. Try MS_PRIVATE|MS_REC directly (works if CAP_SYS_ADMIN + not locked).
+    // 2. If that fails, unshare the mount namespace first (creates a private
+    //    copy of the namespace for this process), then retry.
     let root = cstr("/");
-    // SAFETY: mount with MS_PRIVATE|MS_REC on root, no filesystem type
-    unsafe {
+    // SAFETY: mount with MS_PRIVATE|MS_REC on root — no fstype needed
+    let ms_private_ret = unsafe {
         libc::mount(
             std::ptr::null(),
             root.as_ptr(),
             std::ptr::null(),
             libc::MS_PRIVATE | libc::MS_REC,
             std::ptr::null(),
+        )
+    };
+    if ms_private_ret != 0 {
+        boot_log(
+            "WARN",
+            &format!(
+                "MS_PRIVATE on / failed ({}), trying unshare",
+                std::io::Error::last_os_error()
+            ),
         );
+        // SAFETY: unshare mount namespace so we get a private copy
+        let unshare_ret = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+        if unshare_ret != 0 {
+            boot_log(
+                "WARN",
+                &format!(
+                    "unshare(CLONE_NEWNS) failed ({}), pivot_root may fail",
+                    std::io::Error::last_os_error()
+                ),
+            );
+        }
+        // Retry MS_PRIVATE after unshare (now we own the namespace)
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                root.as_ptr(),
+                std::ptr::null(),
+                libc::MS_PRIVATE | libc::MS_REC,
+                std::ptr::null(),
+            );
+        }
     }
 
     // If overlay device doesn't exist, no overlay disk attached — skip.
@@ -598,7 +766,7 @@ fn setup_persistent_rootfs() {
     };
     if result != 0 {
         let err = std::io::Error::last_os_error();
-        boot_log("ERROR", &format!("failed to mount overlayfs: {}", err));
+        boot_log("ERROR", &format!("failed to mount overlayfs ({})", err));
         // Clean up parallel storage mount to avoid double-mount in
         // mount_storage_disk() fallback path.
         if let Some(handle) = storage_handle {
@@ -611,6 +779,19 @@ fn setup_persistent_rootfs() {
             }
         }
         return;
+    }
+
+    // pivot_root also requires the new root mount not to be shared.
+    // Make the overlayfs mount private immediately after creating it.
+    // SAFETY: mount(NULL, newroot, NULL, MS_PRIVATE|MS_REC, NULL)
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            newroot.as_ptr(),
+            std::ptr::null(),
+            libc::MS_PRIVATE | libc::MS_REC,
+            std::ptr::null(),
+        );
     }
 
     // Create mount point directories in new root and move special mounts
@@ -697,6 +878,8 @@ fn setup_persistent_rootfs() {
 
     // Set working directory to new root
     let _ = std::env::set_current_dir("/");
+
+    boot_log("INFO", "persistent rootfs overlay active (pivot_root done)");
 }
 
 /// Stub for non-Linux platforms.
@@ -2329,6 +2512,7 @@ fn spawn_interactive_command(
     // terminal: true tells crun to set up a controlling terminal (setsid + TIOCSCTTY)
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
     let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity);
+    spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -2421,6 +2605,7 @@ fn spawn_interactive_command(
     let workdir_str = workdir.unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
     let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity);
+    spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -4259,6 +4444,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved, merged.join("etc").join("hosts"));
+    }
+
+    /// Symmetric with `smolvm::data::consts::tests::host_guest_env_literals_are_stable`.
+    ///
+    /// The host declares `ENV_SMOLVM_GPU = "SMOLVM_GPU"` in
+    /// `src/data/consts.rs` and the agent redeclares the same literal
+    /// locally (the agent crate doesn't depend on the host crate).
+    /// Both tests pin the string; if either side is renamed alone,
+    /// its test fires and forces the other side to update in the
+    /// same change. Without the drift guard, a rename in the agent
+    /// would silently break the host→guest GPU-request signaling.
+    #[test]
+    fn host_guest_env_literals_are_stable() {
+        assert_eq!(ENV_SMOLVM_GPU, "SMOLVM_GPU");
+        assert_eq!(ENV_VALUE_ON, "1");
     }
 
     #[test]

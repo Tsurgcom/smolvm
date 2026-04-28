@@ -110,6 +110,8 @@ Default registry: `registry.smolmachines.com`. Digest references require `sha256
 | `--image` | `-I` | run, create, pack create | OCI image |
 | `--name` | `-n` | start, stop, status, exec, resize | Machine name (default: "default") |
 | `--net` | | run, create | Enable outbound networking (off by default) |
+| `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
+| `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
 | `--volume` | `-v` | run, create | Mount host dir: `HOST:GUEST[:ro]` |
 | `--port` | `-p` | run, create | Port mapping: `HOST:GUEST` |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
@@ -135,6 +137,8 @@ workdir = "/app"                      # working directory
 cpus = 2                              # vCPUs (default: 4)
 memory = 1024                         # MiB (default: 8192, elastic via balloon)
 net = true                            # outbound networking (default: false)
+gpu = true                            # GPU acceleration (default: false)
+gpu_vram = 4096                       # GPU VRAM MiB (default: 4096, ignored unless gpu=true)
 storage = 40                          # storage disk GiB (default: 20)
 overlay = 4                           # overlay disk GiB (default: 2)
 
@@ -221,6 +225,43 @@ smolvm machine exec --name myvm -- ssh deploy@server "systemctl restart app"
 The host SSH agent signs challenges but never sends private keys across the boundary. Even with root inside the VM, keys cannot be extracted — this is enforced by the SSH agent protocol and the hypervisor isolation.
 
 Requires `SSH_AUTH_SOCK` to be set on the host. If missing, smolvm exits with an error and remediation instructions.
+
+## GPU Acceleration
+
+Enable the host GPU inside a VM with `--gpu`. Guest Vulkan talks to the host GPU via virtio-gpu/Venus; ANGLE uses it as the WebGL/OpenGL ES backend.
+
+**Host setup:**
+- macOS — bundled, no extra installs needed.
+- Linux — install virglrenderer from the system package manager before use:
+  - Alpine: `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD)
+  - Debian/Ubuntu: `apt install virglrenderer0 mesa-vulkan-drivers`
+
+```bash
+# One-shot GPU workload
+smolvm machine run --gpu --image alpine -- sh -c '
+  apk add --no-cache mesa-vulkan-virtio vulkan-tools
+  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json \
+  vulkaninfo --summary 2>/dev/null | grep deviceName
+'
+# → deviceName = Virtio-GPU Venus (Intel(R) UHD Graphics ...)
+
+# Persistent GPU machine
+smolvm machine create browser --gpu --gpu-vram 2048
+smolvm machine start --name browser
+smolvm machine exec --name browser -- \
+  chromium --headless=new --no-sandbox --use-gl=angle --use-angle=vulkan \
+    --screenshot=/tmp/out.png --window-size=1280,800 https://example.com
+```
+
+The guest must set `VK_ICD_FILENAMES` so the Vulkan loader finds the virtio ICD. Put it in `env` in a Smolfile to avoid repeating it on every exec:
+
+```toml
+gpu = true
+gpu_vram = 2048
+env = ["VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"]
+```
+
+For a complete working example see [`examples/headless-browser/browser.smolfile`](examples/headless-browser/browser.smolfile).
 
 ## File Copy
 

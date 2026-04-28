@@ -310,8 +310,10 @@ impl PackRunCmd {
             memory_mib: self.mem.unwrap_or(manifest.mem),
             network: self.net || manifest.network || !self.port.is_empty(),
             network_backend: self.net_backend,
+            gpu: manifest.gpu,
             storage_gib,
             overlay_gib: self.overlay,
+            gpu_vram_mib: None,
             allowed_cidrs: None,
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
@@ -325,8 +327,8 @@ impl PackRunCmd {
             eprintln!("debug: storage={}", storage_path.display());
             eprintln!("debug: vsock={}", vsock_path.display());
             eprintln!(
-                "debug: resources cpus={} mem={} net={}",
-                resources.cpus, resources.memory_mib, resources.network
+                "debug: resources cpus={} mem={} net={} gpu={}",
+                resources.cpus, resources.memory_mib, resources.network, resources.gpu
             );
         }
 
@@ -1165,8 +1167,10 @@ fn run_from_cache(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
+        gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
+        gpu_vram_mib: None,
         allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
@@ -1488,8 +1492,10 @@ fn daemon_start(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
+        gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
+        gpu_vram_mib: None,
         allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;

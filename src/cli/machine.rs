@@ -249,6 +249,20 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
 
+    /// Enable GPU acceleration (Vulkan via virtio-gpu)
+    #[arg(long, help_heading = "Resources")]
+    pub gpu: bool,
+
+    /// GPU shared-memory region size in MiB. Ignored without --gpu.
+    /// Default 4096 (4 GiB). Must be > 0.
+    #[arg(
+        long = "gpu-vram",
+        value_name = "MiB",
+        help_heading = "Resources",
+        value_parser = crate::cli::parsers::parse_gpu_vram_mib,
+    )]
+    pub gpu_vram_mib: Option<u32>,
+
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N", help_heading = "Resources")]
     pub cpus: u8,
@@ -364,6 +378,8 @@ impl RunCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            gpu: self.gpu,
+            gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -1002,6 +1018,19 @@ pub struct CreateCmd {
     #[arg(long)]
     pub outbound_localhost_only: bool,
 
+    /// Enable GPU acceleration (Vulkan via virtio-gpu)
+    #[arg(long)]
+    pub gpu: bool,
+
+    /// GPU shared-memory region size in MiB. Ignored without --gpu.
+    /// Default 4096 (4 GiB). Must be > 0.
+    #[arg(
+        long = "gpu-vram",
+        value_name = "MiB",
+        value_parser = crate::cli::parsers::parse_gpu_vram_mib,
+    )]
+    pub gpu_vram_mib: Option<u32>,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -1079,6 +1108,8 @@ impl CreateCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            gpu: params.gpu,
+            gpu_vram_mib: params.gpu_vram_mib,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -1090,6 +1121,13 @@ impl CreateCmd {
         )?;
         if self.ssh_agent {
             params.ssh_agent = true;
+        }
+        if self.gpu {
+            params.gpu = true;
+        }
+        // CLI --gpu-vram takes precedence over Smolfile gpu_vram.
+        if let Some(vram) = self.gpu_vram_mib {
+            params.gpu_vram_mib = Some(vram);
         }
         PortMapping::check_duplicates(&params.port)
             .map_err(|e| smolvm::Error::config("validate ports", e))?;
@@ -1175,6 +1213,8 @@ impl CreateCmd {
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
             dns_filter_hosts: None,
+            gpu: manifest.gpu,
+            gpu_vram_mib: None,
             source_smolmachine: Some(canonical_path),
         };
 
